@@ -1,50 +1,46 @@
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+/* Import Tailwind's base styles, component classes, and utility classes */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
-@media (prefers-color-scheme: dark) {
+/* Optional: Define base layer customizations or global styles here */
+@layer base {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
-html,
-body {
-  max-width: 100vw;
-  overflow-x: hidden;
-}
-
-body {
-  color: var(--foreground);
-  background: var(--background);
-}
-
-* {
-  box-sizing: border-box;
-  padding: 0;
-  margin: 0;
-}
-
-a {
-  color: inherit;
-  text-decoration: none;
-}
-
-.imgDark {
-  display: none;
-}
-
-@media (prefers-color-scheme: dark) {
-  html {
-    color-scheme: dark;
+    /* Example CSS variables for theming (used in tailwind.config.ts) */
+    --radius: 0.5rem; /* Example border radius variable */
   }
 
-  .imgLight {
-    display: none;
+  /* Apply dark theme variables when the 'dark' class is present */
+  .dark {
+     /* Add dark theme specific variables if needed */
   }
-  .imgDark {
-    display: unset;
+
+  /* Basic body styles */
+  body {
+    @apply bg-background text-foreground; /* Apply default background/foreground from Tailwind config */
+    font-feature-settings: "rlig" 1, "calt" 1; /* Enable common ligatures */
   }
+
+  /* Add other base styles if necessary */
+  /* For example, default font settings */
+  /* body {
+    @apply font-sans;
+  } */
 }
+
+/* Optional: Define component layer customizations here */
+@layer components {
+  /* Example: Custom component class */
+  /* .btn-primary {
+    @apply py-2 px-4 bg-primary text-white font-semibold rounded-lg shadow-md hover:bg-primary-dark focus:outline-none focus:ring-2 focus:ring-primary focus:ring-opacity-75;
+  } */
+}
+
+/* Optional: Define utility layer customizations here */
+@layer utilities {
+  /* Example: Custom utility class */
+  /* .text-balance {
+    text-wrap: balance;
+  } */
+}
+

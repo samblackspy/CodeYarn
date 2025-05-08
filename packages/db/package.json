@@ -1,0 +1,37 @@
+{
+    "name": "@codeyarn/db",
+    "version": "0.0.0",
+    "private": true,
+    "description": "Database schema, client, and migrations for CodeYarn",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "files": [
+        "dist/**",
+        "prisma/**"
+    ],
+    "scripts": {
+        "build": "tsc -b",
+        "dev": "tsc -b --watch",
+        "lint": "eslint . --ext .ts",
+        "clean": "rm -rf dist tsconfig.tsbuildinfo node_modules",
+        "db:generate": "prisma generate",
+        "db:migrate:dev": "prisma migrate dev",
+        "db:migrate:deploy": "prisma migrate deploy",
+        "db:studio": "prisma studio",
+        "db:seed": "prisma db seed"
+    },
+    "dependencies": {
+        "@prisma/client": "^5.14.0"
+    },
+    "devDependencies": {
+        "@codeyarn/typescript-config": "workspace:*",
+        "@types/node": "^22.15.5",
+        "eslint": "^8.57.0",
+        "prisma": "^5.14.0",
+        "typescript": "^5.4.5"
+    },
+    "prisma": {
+        "seed": "ts-node prisma/seed.ts",
+        "schema": "prisma/schema.prisma"
+    }
+}

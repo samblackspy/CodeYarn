@@ -1,0 +1,13 @@
+{
+  "name": "nodebasic-template",
+  "version": "1.0.0",
+  "description": "A basic Node.js template with nodemon for live reload.",
+  "main": "index.js",
+  "scripts": {
+    "start": "nodemon index.js",
+    "dev": "nodemon index.js"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  }
+}

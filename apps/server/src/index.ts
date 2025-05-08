@@ -1,0 +1,560 @@
+// codeyarn/apps/server/src/index.ts
+import express, { Express, Request, Response, NextFunction } from 'express';
+import http from 'http';
+import { Server as SocketIOServer, Socket } from 'socket.io';
+import cors from 'cors';
+import Docker from 'dockerode';
+import { User, ContainerStatus, FileSystemNode } from '@codeyarn/shared-types';
+import containerRoutes from './routes/containerRoutes';
+import fileRoutes from './routes/fileRoutes';
+import projectRoutes from './routes/projectRoutes';
+import templateRoutes from './routes/templateRoutes';
+import prisma from '@codeyarn/db';
+import { Duplex } from 'stream';
+import path from 'node:path';
+import fs from 'fs';
+// Import the helper function and necessary types from the utils library
+import { buildTreeFromFlatList, PrismaFileNode, FileStructureNode } from './lib/utils';
+
+
+// --- Configuration ---
+const PORT = process.env.PORT || 3001;
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:3000';
+
+// --- Application Setup ---
+const app: Express = express();
+const httpServer = http.createServer(app);
+
+// --- Dockerode Client Setup ---
+const docker = new Docker();
+
+// --- Middleware ---
+app.use(cors({
+    origin: CORS_ORIGIN,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    credentials: true
+}));
+// Use raw text parser specifically for the file content update route first
+app.use('/api/files/:fileId/content', express.text({ type: '*/*' }));
+// Use JSON parser for other routes
+app.use(express.json());
+
+// Simple request logger
+app.use((req: Request, res: Response, next: NextFunction) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+    next();
+});
+
+// --- API Routes ---
+app.get('/api/health', (req: Request, res: Response) => {
+    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+app.use('/api/containers', containerRoutes);
+app.use('/api/files', fileRoutes);
+app.use('/api/projects', projectRoutes); // Mount project router
+app.use('/api/templates', templateRoutes); // Mount template router
+
+// Example Docker test route (optional)
+app.get('/api/docker/containers', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const containers = await docker.listContainers({ all: true });
+        const simplifiedContainers = containers.map(c => ({ id: c.Id, names: c.Names, image: c.Image, state: c.State, status: c.Status }));
+        res.status(200).json(simplifiedContainers);
+     } catch (error) { next(error); }
+});
+
+// --- WebSocket Setup ---
+const io = new SocketIOServer(httpServer, {
+     cors: { origin: CORS_ORIGIN, methods: ["GET", "POST"] },
+ });
+// Map containerId to a general room for other non-PTY specific socket communications
+const containerRoomSockets = new Map<string, Set<string>>();
+// Map containerId to its active PTY session and connected socket IDs
+const activePtySessions = new Map<string, { 
+    stream: NodeJS.ReadWriteStream, 
+    exec: Docker.Exec, 
+    sockets: Set<string>,  // Set of socket.ids connected to this PTY
+    scrollback: string[]   // Buffer for recent terminal output
+}>();
+// Track PTY cleanup timers by containerId
+const ptyCleanupTimers = new Map<string, NodeJS.Timeout>();
+
+const MAX_SCROLLBACK_LINES = 200; // Define max lines for scrollback buffer
+
+// Track file watchers for each container
+const containerFileWatchers = new Map<string, fs.FSWatcher>();
+
+// Track file modification times to detect changes
+const fileModificationTimes = new Map<string, Map<string, number>>();
+
+io.on('connection', (socket: Socket) => {
+    console.log(`[Socket.IO] Client connected: ${socket.id}`);
+    let associatedContainerId: string | null = null;
+
+    socket.on('register-container', (containerId: string) => {
+        if (typeof containerId !== 'string' || !containerId) return;
+        console.log(`[Socket.IO] Registering socket ${socket.id} to container room: ${containerId}`);
+        associatedContainerId = containerId;
+
+        // Manage general room membership
+        if (!containerRoomSockets.has(containerId)) {
+            containerRoomSockets.set(containerId, new Set());
+        }
+        containerRoomSockets.get(containerId)?.add(socket.id);
+        socket.join(containerId); // Socket joins the room for broadcasts
+
+        // --- PTY Session Management ---
+        if (ptyCleanupTimers.has(containerId)) {
+            clearTimeout(ptyCleanupTimers.get(containerId)!);
+            ptyCleanupTimers.delete(containerId);
+            console.log(`[PTY] Cleared pending cleanup timer for container ${containerId} due to new registration.`);
+        }
+
+        let ptySession = activePtySessions.get(containerId);
+        if (ptySession) {
+            // PTY session already exists, add this socket to it
+            ptySession.sockets.add(socket.id);
+            console.log(`[PTY] Socket ${socket.id} re-attached to existing PTY for container ${containerId}. Total sockets: ${ptySession.sockets.size}`);
+            socket.emit('registered', { containerId });
+
+            // Send scrollback buffer to the re-attaching client
+            if (ptySession.scrollback && ptySession.scrollback.length > 0) {
+                socket.emit('terminal-output', { output: ptySession.scrollback.join('') });
+            }
+            socket.emit('terminal-ready', { containerId }); // Notify client terminal is ready
+            // Optionally, you might want to send some scrollback or a screen clear command here
+        } else {
+            // No PTY session exists, start a new one
+            console.log(`[PTY] No existing PTY for ${containerId}. Starting new session for socket ${socket.id}...`);
+            socket.emit('registered', { containerId }); // Emit registered before starting session
+            startPtySessionAndAttachSocket(socket, containerId);
+        }
+        
+        // Set up file watcher for this container if it doesn't exist
+        setupFileWatcher(containerId);
+    });
+
+    socket.on('terminal-input', (data: { input: string }) => {
+        if (associatedContainerId) {
+            const ptySession = activePtySessions.get(associatedContainerId);
+            if (ptySession?.stream && data?.input) {
+                ptySession.stream.write(data.input);
+            } else {
+                console.warn(`[Socket.IO] Received terminal-input for ${associatedContainerId} from ${socket.id} but no active PTY stream found.`);
+            }
+        }
+     });
+
+    socket.on('terminal-resize', async (data: { rows: number, cols: number }) => {
+        if (associatedContainerId) {
+            const ptySession = activePtySessions.get(associatedContainerId);
+            if (ptySession?.exec && data?.rows && data?.cols) {
+                try {
+                    await ptySession.exec.resize({ h: data.rows, w: data.cols });
+                } catch (error) {
+                    console.error(`[Socket.IO] Error resizing PTY for ${associatedContainerId} (socket ${socket.id}):`, error);
+                }
+            }
+        }
+     });
+
+    socket.on('get-initial-fs', async (containerId: string) => {
+         console.log(`[Socket.IO] Received get-initial-fs for ${containerId} from ${socket.id}`);
+         try {
+             const containerRecord = await prisma.container.findUnique({ where: { id: containerId }, select: { projectId: true }});
+             if (!containerRecord) throw new Error(`Container record not found: ${containerId}`);
+             const projectId = containerRecord.projectId;
+
+             // Fetch nodes with Date objects (PrismaFileNode structure)
+             const fileNodesFromDb = await prisma.file.findMany({
+                 where: { projectId: projectId },
+                 select: {
+                    id: true, name: true, path: true, projectId: true, parentId: true,
+                    isDirectory: true, createdAt: true, updatedAt: true,
+                 },
+                 orderBy: { path: 'asc' }
+                });
+
+             // Use the imported helper function - it expects PrismaFileNode[] and returns FileStructureNode | null
+             const fileTree = buildTreeFromFlatList(fileNodesFromDb as PrismaFileNode[], projectId); // Pass projectId
+
+             console.log(`[Socket.IO] Sending initial-fs for project ${projectId} to ${socket.id}`);
+             socket.emit('initial-fs', {
+                 containerId: containerId,
+                 projectId: projectId,
+                 fileStructure: fileTree // Send the nested tree with string dates
+                });
+         } catch (error: any) {
+             console.error(`[Socket.IO Error] Failed to get initial FS for container ${containerId}:`, error);
+             socket.emit('fs-error', { containerId: containerId, error: 'Failed to load file structure' });
+         }
+     });
+
+    socket.on('disconnect', (reason: string) => {
+        console.log(`[Socket.IO] Client disconnected: ${socket.id}. Reason: ${reason}`);
+        const disconnectingContainerId = associatedContainerId; // Capture before cleanup
+        cleanupSocketResources(socket.id, disconnectingContainerId);
+
+        // --- PTY Cleanup Timer Logic ---
+        if (disconnectingContainerId) {
+            const ptySession = activePtySessions.get(disconnectingContainerId);
+            // If PTY session exists and no sockets are connected to it, schedule cleanup
+            if (ptySession && ptySession.sockets.size === 0) {
+                if (!ptyCleanupTimers.has(disconnectingContainerId)) {
+                    console.log(`[PTY] No sockets remaining for PTY on container ${disconnectingContainerId}. Scheduling cleanup in 15s.`);
+                    const timer = setTimeout(() => {
+                        const sessionToKill = activePtySessions.get(disconnectingContainerId);
+                        if (sessionToKill && sessionToKill.sockets.size === 0) { // Double check no new connections
+                            console.log(`[PTY] Killing PTY for container ${disconnectingContainerId} after 15s timeout.`);
+                            try {
+                                sessionToKill.stream.write('\x03'); // Send SIGINT (Ctrl+C) to attempt graceful shutdown
+                                sessionToKill.stream.end();        // Then close the stream
+                                // Optionally, try to force close the exec if stream.end() is not enough
+                                // sessionToKill.exec?.resize({ h: 0, w: 0 }); 
+                            } catch (e) {
+                                console.error(`[PTY] Error sending SIGINT or ending stream for ${disconnectingContainerId}:`, e);
+                            }
+                            activePtySessions.delete(disconnectingContainerId);
+                        } else if (sessionToKill) {
+                            console.log(`[PTY] Cleanup for ${disconnectingContainerId} aborted, new connections detected.`);
+                        }
+                        ptyCleanupTimers.delete(disconnectingContainerId);
+                    }, 15000);
+                    ptyCleanupTimers.set(disconnectingContainerId, timer);
+                }
+            } else if (ptySession) {
+                console.log(`[PTY] Socket ${socket.id} disconnected from ${disconnectingContainerId}. Sockets remaining: ${ptySession.sockets.size}`);
+            }
+        }
+     });
+
+    socket.on('connect_error', (err) => {
+      console.error(`[Socket.IO] Connection error for ${socket.id}: ${err.message}`);
+       cleanupSocketResources(socket.id, associatedContainerId);
+    });
+});
+
+// --- Helper Functions (Terminal & Cleanup) ---
+async function startPtySessionAndAttachSocket(initialSocket: Socket, containerId: string) {
+    console.log(`[PTY] Attempting to start PTY session for container ${containerId} by socket ${initialSocket.id}`);
+    try {
+        const container = docker.getContainer(containerId);
+        const inspectData = await container.inspect();
+        
+        if (!inspectData.State.Running) {
+             console.log(`[PTY] Container ${containerId} is not running.`);
+             initialSocket.emit('terminal-error', { message: `Container ${containerId} is not running.` }); return;
+        }
+
+        const execOptions: Docker.ExecCreateOptions = { 
+            AttachStdin: true, AttachStdout: true, AttachStderr: true, Tty: true, 
+            Cmd: ['/bin/ash'], WorkingDir: '/workspace', User: 'coder'
+        };
+        const exec = await container.exec(execOptions);
+        const stream = await exec.start({ hijack: true, stdin: true });
+
+        console.log(`[PTY] Stream started successfully for ${containerId}. Initial socket: ${initialSocket.id}`);
+        
+        activePtySessions.set(containerId, { 
+            stream, 
+            exec, 
+            sockets: new Set([initialSocket.id]),
+            scrollback: [] // Initialize scrollback buffer
+        });
+
+        // Handle PTY output - broadcast to all sockets in the container's room
+        stream.on('data', (chunk) => {
+            const output = chunk.toString();
+            // Add to scrollback buffer
+            const session = activePtySessions.get(containerId);
+            if (session) {
+                session.scrollback.push(output);
+                if (session.scrollback.length > MAX_SCROLLBACK_LINES) {
+                    session.scrollback.splice(0, session.scrollback.length - MAX_SCROLLBACK_LINES);
+                }
+            }
+            io.to(containerId).emit('terminal-output', { output });
+        });
+
+        stream.on('end', () => {
+            console.log(`[PTY] Stream ended for container ${containerId}`);
+            io.to(containerId).emit('terminal-error', { message: 'Terminal session ended.' });
+            activePtySessions.delete(containerId);
+            // Also clear any cleanup timer if the stream ends unexpectedly
+            if (ptyCleanupTimers.has(containerId)) {
+                clearTimeout(ptyCleanupTimers.get(containerId)!);
+                ptyCleanupTimers.delete(containerId);
+            }
+        });
+
+        stream.on('error', (error) => {
+            console.error(`[PTY] Stream error for container ${containerId}:`, error);
+            io.to(containerId).emit('terminal-error', { message: `Terminal stream error: ${error.message}` });
+            activePtySessions.delete(containerId);
+            if (ptyCleanupTimers.has(containerId)) {
+                clearTimeout(ptyCleanupTimers.get(containerId)!);
+                ptyCleanupTimers.delete(containerId);
+            }
+        });
+
+        // Notify the initial client that the terminal is ready
+        initialSocket.emit('terminal-ready', { containerId });
+        console.log(`[PTY] Emitted 'terminal-ready' to initial socket ${initialSocket.id} for ${containerId}`);
+
+    } catch (error: any) {
+        console.error(`[PTY] Failed to start PTY session for container ${containerId}:`, error);
+        initialSocket.emit('terminal-error', { message: `Failed to start terminal: ${error.message || 'Unknown error'}` });
+    }
+}
+
+// Function to watch container files for changes
+async function setupFileWatcher(containerId: string) {
+    try {
+        // Check if we already have a watcher for this container
+        if (containerFileWatchers.has(containerId)) {
+            console.log(`[FileWatcher] Watcher already exists for container ${containerId}`);
+            return;
+        }
+
+        // Get container info to determine volume mount path
+        const container = await prisma.container.findUnique({
+            where: { id: containerId },
+            select: { projectId: true, templateId: true }
+        });
+
+        if (!container) {
+            console.error(`[FileWatcher] Container ${containerId} not found in database`);
+            return;
+        }
+
+        // For nodebasic template, watch the index.js file
+        // In a real implementation, this would use Docker volume mounts
+        // For this implementation, we'll watch the template directory
+        const templateDir = path.resolve(__dirname, '../../../templates/nodebasic');
+        const indexJsPath = path.join(templateDir, 'index.js');
+
+        console.log(`[FileWatcher] Setting up watcher for ${indexJsPath}`);
+
+        // Initialize modification time tracking
+        if (!fileModificationTimes.has(containerId)) {
+            fileModificationTimes.set(containerId, new Map());
+        }
+
+        // Get initial file stats
+        try {
+            const stats = fs.statSync(indexJsPath);
+            fileModificationTimes.get(containerId)?.set(indexJsPath, stats.mtimeMs);
+        } catch (err) {
+            console.error(`[FileWatcher] Error getting initial file stats: ${err}`);
+        }
+
+        // Set up the file watcher
+        const watcher = fs.watch(templateDir, (eventType, filename) => {
+            if (filename === 'index.js') {
+                try {
+                    const stats = fs.statSync(indexJsPath);
+                    const lastMtime = fileModificationTimes.get(containerId)?.get(indexJsPath) || 0;
+                    
+                    // Only emit change event if modification time has changed
+                    if (stats.mtimeMs > lastMtime) {
+                        console.log(`[FileWatcher] Detected change in ${filename} for container ${containerId}`);
+                        
+                        // Update modification time
+                        fileModificationTimes.get(containerId)?.set(indexJsPath, stats.mtimeMs);
+                        
+                        // Emit event to all sockets in the container room
+                        io.to(containerId).emit('file-changed', {
+                            containerId,
+                            path: `/workspace/${filename}`,
+                            type: 'file',
+                            event: eventType
+                        });
+                    }
+                } catch (err) {
+                    console.error(`[FileWatcher] Error checking file stats: ${err}`);
+                }
+            }
+        });
+
+        // Store the watcher
+        containerFileWatchers.set(containerId, watcher);
+        console.log(`[FileWatcher] Watcher set up for container ${containerId}`);
+
+    } catch (error) {
+        console.error(`[FileWatcher] Error setting up watcher for container ${containerId}:`, error);
+    }
+}
+
+function cleanupFileWatcher(containerId: string) {
+    const watcher = containerFileWatchers.get(containerId);
+    if (watcher) {
+        console.log(`[FileWatcher] Closing watcher for container ${containerId}`);
+        watcher.close();
+        containerFileWatchers.delete(containerId);
+        fileModificationTimes.delete(containerId);
+    }
+}
+
+// Helper function to find the full container ID from a partial ID
+async function findFullContainerId(partialId: string): Promise<string | null> {
+    try {
+        // If the ID is already a full ID, return it
+        if (partialId.length > 12) {
+            return partialId;
+        }
+        
+        // Find container by prefix
+        const allContainers = await prisma.container.findMany({ select: { id: true } });
+        const containerRecord = allContainers.find(c => c.id.startsWith(partialId));
+        
+        if (containerRecord) {
+            return containerRecord.id;
+        }
+        
+        return null;
+    } catch (error) {
+        console.error(`[API Internal] Error finding full container ID for ${partialId}:`, error);
+        return null;
+    }
+}
+
+function cleanupSocketResources(socketId: string, containerId: string | null) {
+    // Remove from general room socket map
+    if (containerId) {
+        containerRoomSockets.get(containerId)?.delete(socketId);
+        if (containerRoomSockets.get(containerId)?.size === 0) {
+            containerRoomSockets.delete(containerId);
+            // Clean up file watcher when no sockets are in the general room for this container
+            // This might be too aggressive if PTY session still active, consider PTY socket count too
+            // cleanupFileWatcher(containerId); // For now, let PTY disconnect handle PTY related watcher cleanup if any.
+        }
+
+        // Remove socket from its PTY session's active socket list
+        const ptySession = activePtySessions.get(containerId);
+        if (ptySession) {
+            ptySession.sockets.delete(socketId);
+            console.log(`[PTY] Socket ${socketId} removed from PTY on ${containerId}. Sockets remaining: ${ptySession.sockets.size}`);
+        }
+    }
+}
+
+// --- Internal API Endpoint for Watcher ---
+app.post('/api/internal/filesystem-event', async (req: Request, res: Response) => {
+    const eventData = req.body;
+    console.log('[API Internal] Received FS Event:', JSON.stringify(eventData));
+    const { containerId, event, type, path: eventPath } = eventData;
+
+    if (!containerId || !event || !type || !eventPath || typeof eventPath !== 'string') {
+        console.warn('[API Internal] Invalid FS event received:', eventData);
+        return res.status(400).send('Invalid event data');
+    }
+    
+    // Immediately emit file-changed event to all clients in the container room
+    // This ensures real-time updates even if the database operations fail
+    const fullContainerId = await findFullContainerId(containerId);
+    if (fullContainerId) {
+        console.log(`[API Internal] Emitting file-changed event to room: ${fullContainerId}`);
+        io.to(fullContainerId).emit('file-changed', {
+            containerId: fullContainerId,
+            path: eventPath,
+            type,
+            event
+        });
+    }
+
+    try {
+        // Container ID from watcher might be truncated (first 12 chars), so we need to find by prefix
+        const allContainers = await prisma.container.findMany({ select: { id: true, projectId: true } });
+        const containerRecord = allContainers.find(c => c.id.startsWith(containerId));
+        
+        if (!containerRecord) {
+            console.error(`[API Internal] Container record not found for ID: ${containerId}. Cannot process FS event.`);
+            return res.status(404).send('Container record not found');
+        }
+        const projectId = containerRecord.projectId;
+
+        let nodeDataForBroadcast: FileSystemNode | undefined = undefined; // Type expects string dates and content: string | undefined
+
+        if (event === 'create') {
+            const parentPath = path.dirname(eventPath).replace(/\\/g, '/');
+            const name = path.basename(eventPath);
+            const isDirectory = type === 'directory';
+            let parentId: string | null = null;
+            if (parentPath !== '/workspace' && parentPath !== '/') {
+                 const parentNode = await prisma.file.findUnique({ where: { projectId_path: { projectId, path: parentPath } }, select: { id: true, isDirectory: true } });
+                 if (!parentNode || !parentNode.isDirectory) { return res.status(400).send('Parent directory not found'); }
+                 parentId = parentNode.id;
+            }
+            const existing = await prisma.file.findUnique({ where: { projectId_path: { projectId, path: eventPath } } });
+            if (existing) { console.warn(`[API Internal] Node ${eventPath} already exists. Ignoring create.`); }
+            else {
+                // newNode has Date objects and content: string | null
+                const newNode = await prisma.file.create({ data: { name, path: eventPath, isDirectory, projectId, parentId, content: isDirectory ? null : '' } });
+                console.log(`[API Internal] Created DB record for ${eventPath} (ID: ${newNode.id})`);
+                // Convert dates and handle content for broadcast (FileSystemNode type)
+                nodeDataForBroadcast = {
+                    id: newNode.id,
+                    name: newNode.name,
+                    path: newNode.path,
+                    projectId: newNode.projectId,
+                    parentId: newNode.parentId,
+                    isDirectory: newNode.isDirectory,
+                    content: newNode.content ?? undefined, // Map null content to undefined
+                    createdAt: newNode.createdAt.toISOString(), // Convert Date to string
+                    updatedAt: newNode.updatedAt.toISOString(), // Convert Date to string
+                 };
+            }
+        } else if (event === 'delete') {
+            const nodeToDelete = await prisma.file.findUnique({ where: { projectId_path: { projectId, path: eventPath } }, select: { id: true, isDirectory: true } });
+            if (!nodeToDelete) { console.warn(`[API Internal] Node ${eventPath} not found for delete.`); }
+            else {
+                const idsToDelete: string[] = [nodeToDelete.id];
+                if (nodeToDelete.isDirectory) { /* ... find descendants ... */
+                    const queue = [nodeToDelete.id];
+                    while (queue.length > 0) {
+                        const currentParentId = queue.shift();
+                        const children = await prisma.file.findMany({ where: { parentId: currentParentId }, select: { id: true, isDirectory: true } });
+                        children.forEach(child => { idsToDelete.push(child.id); if (child.isDirectory) queue.push(child.id); });
+                    }
+                 }
+                const deleteResult = await prisma.file.deleteMany({ where: { id: { in: idsToDelete } } });
+                console.log(`[API Internal] Deleted ${deleteResult.count} record(s) from DB for path ${eventPath}`);
+            }
+        } else if (event === 'modify') {
+            const updatedNode = await prisma.file.update({ where: { projectId_path: { projectId, path: eventPath } }, data: { updatedAt: new Date() } })
+                .catch(err => { if (err.code === 'P2025') { console.warn(`[API Internal] Node ${eventPath} not found for modify.`); return null; } throw err; });
+            if (updatedNode) { console.log(`[API Internal] Updated timestamp for modified file: ${eventPath}`); }
+        } else { console.warn(`[API Internal] Received unhandled event type: ${event}`); }
+
+        // Broadcast the event via WebSocket
+        if (event === 'create' || event === 'delete' || event === 'modify') {
+            io.to(containerId).emit('fs-update', {
+                containerId, event, type, path: eventPath,
+                ...(event === 'create' && nodeDataForBroadcast && { node: nodeDataForBroadcast }),
+            });
+            console.log(`[API Internal] Broadcasted 'fs-update' to room: ${containerId}`);
+        }
+        res.status(204).send();
+    } catch (error: any) {
+        console.error(`[API Internal Error] Failed to process FS event for container ${containerId}:`, error);
+        res.status(500).send('Internal Server Error');
+    }
+});
+
+// --- Error Handling & Server Startup ---
+app.use((req: Request, res: Response) => { res.status(404).json({ message: 'Not Found' }); });
+app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+    console.error("[Error Handler]", err.stack);
+    const errorMessage = process.env.NODE_ENV === 'production' ? 'Internal Server Error' : err.message;
+    res.status(500).json({ message: 'Internal Server Error', error: errorMessage });
+ });
+httpServer.listen(PORT, () => {
+    console.log(`--------------------------------------`);
+    console.log(`  CodeYarn Server listening on port ${PORT}`);
+    console.log(`  Allowed CORS origin: ${CORS_ORIGIN}`);
+    console.log(`--------------------------------------`);
+ });
+process.on('SIGTERM', () => {
+    console.log('SIGTERM signal received: closing HTTP server');
+    io.close(() => { console.log('[Socket.IO] Server closed.'); httpServer.close(() => { console.log('HTTP server closed.'); process.exit(0); }); });
+});

@@ -1,0 +1,1 @@
+{"root":["./src/index.ts","./src/lib/utils.ts","./src/routes/containerroutes.ts","./src/routes/fileroutes.ts","./src/routes/projectroutes.ts","./src/watcher/watcher.ts"],"version":"5.8.2"}

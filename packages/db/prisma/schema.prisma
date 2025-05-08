@@ -1,0 +1,121 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Define the generator for Prisma Client (TypeScript)
+generator client {
+  provider = "prisma-client-js"
+  // Optional: Specify output directory if needed, default is node_modules/.prisma/client
+  // output   = "../node_modules/.prisma/client"
+}
+
+// Define the datasource (PostgreSQL)
+datasource db {
+  provider = "postgresql"
+  // The DATABASE_URL environment variable is used to connect
+  // It's defined in the .env file in this directory (packages/db/.env)
+  url      = env("DATABASE_URL")
+}
+
+// --- Models based on @codeyarn/shared-types ---
+
+// User model
+model User {
+  id        String   @id @default(cuid()) // Using CUID for unique IDs
+  email     String   @unique // User's email must be unique
+  name      String? // Optional display name
+  avatarUrl String? // Optional avatar URL
+  createdAt DateTime @default(now()) // Timestamp for creation
+  updatedAt DateTime @updatedAt // Timestamp for last update
+
+  // Relations
+  projects Project[] // A user can own multiple projects
+  // Add relations for collaborators later if needed
+}
+
+// Project model
+model Project {
+  id            String   @id @default(cuid())
+  name          String
+  description   String?
+  templateId    String // ID of the template used (references Template model)
+  ownerId       String // ID of the owner (references User model)
+  containerId   String?  @unique // ID of the associated Docker container (can be null)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  lastAccessedAt DateTime?
+
+  // Relations
+  owner         User     @relation(fields: [ownerId], references: [id], onDelete: Cascade) // Link to owner User, delete project if user is deleted
+  template      Template @relation(fields: [templateId], references: [id], onDelete: Restrict) // Link to Template, prevent template deletion if used by projects
+  files         File[]   // A project has many files/folders
+  container     Container? // A project might have one container associated with it
+}
+
+// Template model (for storing available templates)
+model Template {
+  id            String  @id // Use predefined IDs like "nextjs-ts"
+  name          String
+  description   String
+  iconUrl       String?
+  tags          String[] // Array of strings for tags
+  dockerImage   String
+  sourceHostPath  String // Path to the source code on the host
+  repositoryUrl String?
+  startCommand  String?
+  defaultPort   Int
+
+  // Relations
+  projects Project[] // A template can be used by multiple projects
+}
+
+// Container model (stores info about active Docker containers)
+model Container {
+  id           String          @id // Docker container ID is the primary key
+  projectId    String          @unique // Each container belongs to one project
+  templateId   String
+  status       ContainerStatus // Use the enum defined below
+  hostPort     Int?            // Mapped host port (can be null)
+  internalPort Int             // Internal port the container exposes
+  createdAt    DateTime        @default(now())
+  startedAt    DateTime?
+  stoppedAt    DateTime?
+
+  // Relations
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade) // Link to Project, delete container info if project is deleted
+}
+
+// FileSystemNode model (represents files and folders)
+model File {
+  id          String   @id @default(cuid())
+  name        String
+  path        String // Full path within the workspace, should be unique per project
+  projectId   String
+  parentId    String?  // ID of the parent folder
+  isDirectory Boolean
+  content     String?  @db.Text // Use Text type for potentially large file content
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  project Project  @relation(fields: [projectId], references: [id], onDelete: Cascade) // Link to Project, delete files if project is deleted
+  parent  File?    @relation("FolderChildren", fields: [parentId], references: [id], onDelete: Cascade) // Self-relation for parent folder
+  children File[]  @relation("FolderChildren") // Self-relation for child items
+
+  // Index to ensure path is unique within a project
+  @@unique([projectId, path])
+  // Index for faster lookup of children by parentId
+  @@index([parentId])
+}
+
+// --- Enums ---
+
+// Enum for Container Status (matches shared type)
+enum ContainerStatus {
+  CREATING
+  RUNNING
+  STOPPED
+  ERROR
+  DELETED
+  UNKNOWN
+}
+

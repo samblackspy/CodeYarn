@@ -1,0 +1,22 @@
+{
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+      "outDir": "./dist/watcher",
+      "rootDir": "./src/watcher",
+      "declaration": false,
+      "declarationMap": false,
+      "sourceMap": false,
+      "module": "CommonJS",
+      "composite": false
+    },
+    "include": ["src/watcher/**/*.ts"],
+    "exclude": [
+      "node_modules",
+      "dist", 
+      "src/index.ts",
+      "src/routes",
+      "src/lib", 
+      "**/*.test.ts"
+   ]
+  }
+  

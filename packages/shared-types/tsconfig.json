@@ -1,0 +1,16 @@
+{
+    "extends": "@codeyarn/typescript-config/base.json",
+    "compilerOptions": {
+      "outDir": "./dist",
+      "rootDir": "./src",
+      "declaration": true,
+      "declarationMap": true,
+      "sourceMap": true,
+      "module": "NodeNext",
+      "composite": true,
+      "incremental": true
+    },
+    "include": ["src/**/*.ts"],
+    "exclude": ["node_modules", "dist", "build", "**/*.test.ts"]
+  }
+  
