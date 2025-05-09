@@ -43,8 +43,8 @@ COPY --from=deps /app/packages ./packages/
 
 # Copy the rest of your application code
 # (Adjust if your tsconfig paths or other dependencies are outside these dirs)
-COPY tsconfig.json ./
-COPY .eslintrc.js ./
+COPY apps/web/tsconfig.json ./tsconfig.json
+COPY apps/web/.eslintrc.js ./
 # Or your eslint config file name
 # If you have specific typescript configs for the workspace, copy them too
 # e.g., COPY packages/typescript-config ./packages/typescript-config
