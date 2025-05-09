@@ -2,12 +2,64 @@
 version: '3.8' # Specify docker-compose version
 
 services:
+  # Nginx Service
+  nginx:
+    image: nginx:alpine
+    container_name: codeyarn-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro # Mount nginx.conf from project root
+      - /etc/letsencrypt:/etc/letsencrypt:ro # Mount Let's Encrypt certs from host
+      - /var/www/certbot:/var/www/certbot:ro # Mount Certbot webroot from host
+    networks:
+      - codeyarn-network
+    depends_on:
+      - web
+      - server
+
+  # Frontend Web Service (Next.js)
+  web:
+    build:
+      context: . # Build context is the root of the monorepo
+      dockerfile: apps/web/Dockerfile
+    container_name: codeyarn-web
+    environment:
+      - NODE_ENV=production
+      # NEXT_PUBLIC_API_BASE_URL is not strictly needed if Next.js makes relative API calls
+      # and Nginx handles the proxy. For dev, it's set in next.config.js logic.
+      # If set, ensure it matches the Nginx setup if used directly by client-side JS.
+      # For server-side rendering, Next.js will use rewrites or Nginx-proxied paths.
+      - NEXT_PUBLIC_API_BASE_URL=/ # Or keep as http://server:3001 if some client-side absolute URLs are needed before Nginx step
+    depends_on:
+      server:
+        condition: service_started
+    networks:
+      - codeyarn-network
+    restart: unless-stopped
+
+  # Backend Server Service (Express.js)
+  server:
+    build:
+      context: . # Build context is the root of the monorepo
+      dockerfile: apps/server/Dockerfile
+    container_name: codeyarn-server
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://codeyarn_user:codeyarn_password@postgres-db:5432/codeyarn_db
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+    networks:
+      - codeyarn-network
+    restart: unless-stopped
+
   # PostgreSQL Database Service
   postgres-db:
     image: postgres:15-alpine # Use official PostgreSQL image (version 15 on Alpine Linux)
     container_name: codeyarn-postgres-db # Assign a specific container name
-    ports:
-      - "5432:5432" # Map host port 5432 to container port 5432
     environment:
       # Define environment variables for database setup
       # These should match the credentials in packages/db/.env DATABASE_URL
@@ -28,16 +80,6 @@ services:
       retries: 5
     restart: unless-stopped # Restart policy
 
-  # Optional: Add other services later (e.g., Redis for caching/queues)
-  # redis:
-  #   image: redis:alpine
-  #   container_name: codeyarn-redis
-  #   ports:
-  #     - "6379:6379"
-  #   networks:
-  #     - codeyarn-network
-  #   restart: unless-stopped
-
 # Define named volume for data persistence
 volumes:
   postgres-data:
@@ -47,4 +89,3 @@ volumes:
 networks:
   codeyarn-network:
     driver: bridge
-
