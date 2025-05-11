@@ -35,13 +35,24 @@ RUN mkdir -p /app
 # IMPORTANT: Adjust source path based on your Docker build context.
 # This assumes the context is the monorepo root.
 COPY apps/server/dist/watcher/watcher.js /app/watcher.js
-COPY templates/nodebasic/package.json /workspace/package.json
+# Install global tools as root
 RUN npm install -g nodemon
+
+# Copy system scripts
 COPY templates/nodebasic/scan-workspace.js /usr/local/bin/scan-workspace.js
 RUN chmod +x /usr/local/bin/scan-workspace.js
-COPY templates/nodebasic/index.js /workspace/index.js
 COPY templates/nodebasic/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
+
+# Copy template files to workspace (as root)
+COPY templates/nodebasic/package.json /workspace/package.json
+COPY templates/nodebasic/index.js /workspace/index.js
+
+# Change ownership of all workspace files to coder
+RUN chown -R coder:coder /workspace/*
+
+# Switch to coder user for container runtime
+USER coder
 
 # --- Container Execution ---
 # Expose the default port (informational)

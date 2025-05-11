@@ -16,7 +16,7 @@ interface FileExplorerProps {
 }
 
 // Define the WebSocket connection URL
-const SOCKET_SERVER_URL = process.env.NEXT_PUBLIC_SOCKET_SERVER_URL || 'http://localhost:3001';
+const SOCKET_SERVER_URL = process.env.NEXT_PUBLIC_SOCKET_SERVER_URL || '';
 
 // Type for the initial payload structure received from backend
 interface InitialFileStructureNode extends FileSystemNode {
@@ -311,10 +311,25 @@ export default function FileExplorer({ }: FileExplorerProps): JSX.Element {
         if (socketRef.current && socketRef.current.connected) { socketRef.current.disconnect(); }
 
         console.log(`[FileExplorer] Initializing for container: ${containerId}`);
-        const socket = io(SOCKET_SERVER_URL, { reconnectionAttempts: 3 });
-        socketRef.current = socket;
+        
 
-        socket.on('connect', () => { console.log(`[FileExplorer] Socket connected: ${socket.id}`); setIsConnected(true); socket.emit('register-container', containerId); socket.emit('get-initial-fs', containerId); });
+	  const socket = io('', {
+            path: '/socket.io/',
+            transports: ['websocket', 'polling'],
+            reconnectionAttempts: 5,
+            reconnectionDelay: 1000,
+            timeout: 20000,
+            forceNew: false,
+            withCredentials: true
+        });
+        socketRef.current = socket;
+	
+	
+	
+	
+	
+	
+	socket.on('connect', () => { console.log(`[FileExplorer] Socket connected: ${socket.id}`); setIsConnected(true); socket.emit('register-container', containerId); socket.emit('get-initial-fs', containerId); });
         socket.on('disconnect', (reason: string) => { console.log(`[FileExplorer] Socket disconnected: ${reason}`); setIsConnected(false); setIsLoading(false); });
         socket.on('connect_error', (err) => { console.error(`[FileExplorer] Socket connection error: ${err.message}`); setIsConnected(false); setIsLoading(false); });
 

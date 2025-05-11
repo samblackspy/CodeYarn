@@ -21,13 +21,14 @@
         "db:seed": "prisma db seed"
     },
     "dependencies": {
-        "@prisma/client": "^5.14.0"
+        "@prisma/client": "^5.22.0"
     },
     "devDependencies": {
         "@codeyarn/typescript-config": "workspace:*",
         "@types/node": "^22.15.5",
         "eslint": "^8.57.0",
         "prisma": "^5.14.0",
+        "ts-node": "^10.9.2",
         "typescript": "^5.4.5"
     },
     "prisma": {

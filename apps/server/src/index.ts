@@ -20,9 +20,12 @@ import { buildTreeFromFlatList, PrismaFileNode, FileStructureNode } from './lib/
 // --- Configuration ---
 const PORT = process.env.PORT || 3001;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:3000';
+console.log(`[Server] Starting on port ${PORT} with CORS origin: ${CORS_ORIGIN}`);
 
 // --- Application Setup ---
 const app: Express = express();
+app.set('trust proxy', 1); // Trust the proxy for secure cookies
+
 const httpServer = http.createServer(app);
 
 // --- Dockerode Client Setup ---
@@ -65,8 +68,27 @@ app.get('/api/docker/containers', async (req: Request, res: Response, next: Next
 
 // --- WebSocket Setup ---
 const io = new SocketIOServer(httpServer, {
-     cors: { origin: CORS_ORIGIN, methods: ["GET", "POST"] },
- });
+    cors: {
+        origin: process.env.CORS_ORIGIN || '*',
+        methods: ['GET', 'POST'],
+        credentials: true
+    },
+    path: '/socket.io/',
+    pingTimeout: 120000,     // Increased timeout
+    pingInterval: 30000,     // Adjusted interval
+    transports: ['websocket', 'polling'],
+    allowEIO3: true,         // Allow Engine.IO v3 compatibility
+    cookie: {
+        name: 'io',
+        httpOnly: false,
+        secure: process.env.NODE_ENV === 'production'
+    },
+    connectTimeout: 45000    // Longer connect timeout
+});
+
+console.log(`[Socket.IO] Initialized with CORS origin: ${CORS_ORIGIN}`);
+
+
 // Map containerId to a general room for other non-PTY specific socket communications
 const containerRoomSockets = new Map<string, Set<string>>();
 // Map containerId to its active PTY session and connected socket IDs
@@ -439,107 +461,182 @@ function cleanupSocketResources(socketId: string, containerId: string | null) {
 }
 
 // --- Internal API Endpoint for Watcher ---
+
+
 app.post('/api/internal/filesystem-event', async (req: Request, res: Response) => {
     const eventData = req.body;
     console.log('[API Internal] Received FS Event:', JSON.stringify(eventData));
-    const { containerId, event, type, path: eventPath } = eventData;
 
-    if (!containerId || !event || !type || !eventPath || typeof eventPath !== 'string') {
+    const { containerId: shortContainerId, event, type, path: rawEventPath } = eventData;
+
+    if (!shortContainerId || !event || !type || !rawEventPath || typeof rawEventPath !== 'string') {
         console.warn('[API Internal] Invalid FS event received:', eventData);
         return res.status(400).send('Invalid event data');
     }
-    
-    // Immediately emit file-changed event to all clients in the container room
-    // This ensures real-time updates even if the database operations fail
-    const fullContainerId = await findFullContainerId(containerId);
-    if (fullContainerId) {
-        console.log(`[API Internal] Emitting file-changed event to room: ${fullContainerId}`);
-        io.to(fullContainerId).emit('file-changed', {
-            containerId: fullContainerId,
-            path: eventPath,
-            type,
-            event
-        });
+
+    // --- 1. Normalize Path ---
+    // Path from watcher is typically absolute within the container, starting with /workspace
+    // Path in DB is stored relative to the logical workspace root, e.g., /index.js, /app/page.tsx
+    let dbPath = rawEventPath;
+    if (dbPath.startsWith('/workspace')) {
+        dbPath = dbPath.substring('/workspace'.length); // Removes leading "/workspace"
+        if (dbPath === '') { // If the path was exactly "/workspace"
+            dbPath = '/'; // Represent the workspace root as "/" for DB lookup, or a specific designated marker
+                           // This assumes your scan-workspace.js also creates a root File record with path "/" or "/workspace"
+                           // For now, let's assume files inside workspace root are like "/index.js"
+        }
+    }
+    // Ensure it always starts with a single slash if not already, unless it's the root itself
+    if (dbPath !== '/' && !dbPath.startsWith('/')) {
+        dbPath = '/' + dbPath;
+    }
+    console.log(`[API Internal] Watcher path: "${rawEventPath}", Normalized DB path: "${dbPath}"`);
+
+    // --- 2. Find fullContainerId and ProjectId ---
+    const fullContainerId = await findFullContainerId(shortContainerId); // Use your existing helper
+
+    if (!fullContainerId) {
+        console.error(`[API Internal] Full container ID not found for short ID: ${shortContainerId}. Cannot process event for path: ${dbPath}.`);
+        // It's often better to send a 204 so the watcher doesn't get stuck retrying on a 404 for a container that might be legitimately gone.
+        return res.status(204).send(); 
     }
 
     try {
-        // Container ID from watcher might be truncated (first 12 chars), so we need to find by prefix
-        const allContainers = await prisma.container.findMany({ select: { id: true, projectId: true } });
-        const containerRecord = allContainers.find(c => c.id.startsWith(containerId));
-        
+        const containerRecord = await prisma.container.findUnique({
+            where: { id: fullContainerId },
+            select: { projectId: true }
+        });
+
         if (!containerRecord) {
-            console.error(`[API Internal] Container record not found for ID: ${containerId}. Cannot process FS event.`);
-            return res.status(404).send('Container record not found');
+            console.error(`[API Internal] Container DB record not found for full ID: ${fullContainerId}. Cannot process event for path: ${dbPath}.`);
+            return res.status(404).send('Container record not found in DB');
         }
         const projectId = containerRecord.projectId;
+        let fileSystemNodeForBroadcast: FileSystemNode | null = null; // Type from @codeyarn/shared-types
 
-        let nodeDataForBroadcast: FileSystemNode | undefined = undefined; // Type expects string dates and content: string | undefined
-
+        // --- 3. Process Event and Update Database ---
         if (event === 'create') {
-            const parentPath = path.dirname(eventPath).replace(/\\/g, '/');
-            const name = path.basename(eventPath);
+            const name = path.basename(dbPath);
+            // Determine parentDbPath for Prisma relation.
+            // If dbPath is "/foo.txt", parentDbPath is "/".
+            // If dbPath is "/bar/foo.txt", parentDbPath is "/bar".
+            let parentDbPath = path.dirname(dbPath).replace(/\\/g, '/');
+            if (parentDbPath === '.') parentDbPath = '/'; // Handles files directly in root, dirname of /foo.txt is .
+            
             const isDirectory = type === 'directory';
             let parentId: string | null = null;
-            if (parentPath !== '/workspace' && parentPath !== '/') {
-                 const parentNode = await prisma.file.findUnique({ where: { projectId_path: { projectId, path: parentPath } }, select: { id: true, isDirectory: true } });
-                 if (!parentNode || !parentNode.isDirectory) { return res.status(400).send('Parent directory not found'); }
-                 parentId = parentNode.id;
+
+            if (parentDbPath !== '/') { // If not a direct child of the conceptual root
+                const parentNode = await prisma.file.findUnique({
+                    where: { projectId_path: { projectId, path: parentDbPath } },
+                    select: { id: true, isDirectory: true }
+                });
+                if (parentNode && parentNode.isDirectory) {
+                    parentId = parentNode.id;
+                } else {
+                    console.warn(`[API Internal] Parent node at DB path "${parentDbPath}" not found or not a directory for creating "${dbPath}". Will create as root-level.`);
+                    // If specific parent isn't found, it becomes a child of the implicit project root.
+                    // This requires your frontend/DB to handle root items having parentId: null or a specific root folder ID.
+                    // For now, let's assume your initial scan creates a '/workspace' (or logical root like '/') File record.
+                    // If scan-workspace.js creates a File record with path: "/workspace", find its ID.
+                    const workspaceRootFileNode = await prisma.file.findUnique({ where: {projectId_path: {projectId, path: "/workspace"}}});
+                    if(workspaceRootFileNode) parentId = workspaceRootFileNode.id;
+
+                }
+            } else { // It's a direct child of / (e.g. /index.js), parent is the /workspace node
+                 const workspaceRootFileNode = await prisma.file.findUnique({ where: {projectId_path: {projectId, path: "/workspace"}}});
+                 if(workspaceRootFileNode) parentId = workspaceRootFileNode.id;
             }
-            const existing = await prisma.file.findUnique({ where: { projectId_path: { projectId, path: eventPath } } });
-            if (existing) { console.warn(`[API Internal] Node ${eventPath} already exists. Ignoring create.`); }
-            else {
-                // newNode has Date objects and content: string | null
-                const newNode = await prisma.file.create({ data: { name, path: eventPath, isDirectory, projectId, parentId, content: isDirectory ? null : '' } });
-                console.log(`[API Internal] Created DB record for ${eventPath} (ID: ${newNode.id})`);
-                // Convert dates and handle content for broadcast (FileSystemNode type)
-                nodeDataForBroadcast = {
-                    id: newNode.id,
-                    name: newNode.name,
-                    path: newNode.path,
-                    projectId: newNode.projectId,
-                    parentId: newNode.parentId,
-                    isDirectory: newNode.isDirectory,
-                    content: newNode.content ?? undefined, // Map null content to undefined
-                    createdAt: newNode.createdAt.toISOString(), // Convert Date to string
-                    updatedAt: newNode.updatedAt.toISOString(), // Convert Date to string
-                 };
+
+
+            const existingNode = await prisma.file.findUnique({ where: { projectId_path: { projectId, path: dbPath } } });
+            if (existingNode) {
+                console.warn(`[API Internal] Node ${dbPath} (event: create) reported by watcher already exists in DB. Updating timestamp and clearing content.`);
+                const updatedNode = await prisma.file.update({
+                    where: { id: existingNode.id },
+                    data: { updatedAt: new Date(), content: isDirectory ? null : null, isDirectory: isDirectory /* in case type changed */ }
+                });
+                 fileSystemNodeForBroadcast = { ...updatedNode, createdAt: updatedNode.createdAt.toISOString(), updatedAt: updatedNode.updatedAt.toISOString(), content: updatedNode.content ?? undefined };
+            } else {
+                const newNode = await prisma.file.create({
+                    data: {
+                        name,
+                        path: dbPath,
+                        isDirectory,
+                        projectId,
+                        parentId,
+                        content: isDirectory ? null : null, // Set content to null for files, so editor fetches fresh
+                    }
+                });
+                console.log(`[API Internal] Created DB record for ${dbPath} (ID: ${newNode.id})`);
+                fileSystemNodeForBroadcast = { ...newNode, createdAt: newNode.createdAt.toISOString(), updatedAt: newNode.updatedAt.toISOString(), content: newNode.content ?? undefined };
             }
         } else if (event === 'delete') {
-            const nodeToDelete = await prisma.file.findUnique({ where: { projectId_path: { projectId, path: eventPath } }, select: { id: true, isDirectory: true } });
-            if (!nodeToDelete) { console.warn(`[API Internal] Node ${eventPath} not found for delete.`); }
-            else {
+            const nodeToDelete = await prisma.file.findUnique({
+                where: { projectId_path: { projectId, path: dbPath } }, // Use normalized dbPath
+                select: { id: true, isDirectory: true }
+            });
+
+            if (!nodeToDelete) {
+                console.warn(`[API Internal] Node ${dbPath} not found in DB for delete event.`);
+            } else {
                 const idsToDelete: string[] = [nodeToDelete.id];
-                if (nodeToDelete.isDirectory) { /* ... find descendants ... */
+                if (nodeToDelete.isDirectory) {
                     const queue = [nodeToDelete.id];
                     while (queue.length > 0) {
-                        const currentParentId = queue.shift();
+                        const currentParentId = queue.shift()!;
                         const children = await prisma.file.findMany({ where: { parentId: currentParentId }, select: { id: true, isDirectory: true } });
                         children.forEach(child => { idsToDelete.push(child.id); if (child.isDirectory) queue.push(child.id); });
                     }
-                 }
+                }
                 const deleteResult = await prisma.file.deleteMany({ where: { id: { in: idsToDelete } } });
-                console.log(`[API Internal] Deleted ${deleteResult.count} record(s) from DB for path ${eventPath}`);
+                console.log(`[API Internal] Deleted ${deleteResult.count} DB record(s) for path ${dbPath}`);
             }
         } else if (event === 'modify') {
-            const updatedNode = await prisma.file.update({ where: { projectId_path: { projectId, path: eventPath } }, data: { updatedAt: new Date() } })
-                .catch(err => { if (err.code === 'P2025') { console.warn(`[API Internal] Node ${eventPath} not found for modify.`); return null; } throw err; });
-            if (updatedNode) { console.log(`[API Internal] Updated timestamp for modified file: ${eventPath}`); }
-        } else { console.warn(`[API Internal] Received unhandled event type: ${event}`); }
-
-        // Broadcast the event via WebSocket
-        if (event === 'create' || event === 'delete' || event === 'modify') {
-            io.to(containerId).emit('fs-update', {
-                containerId, event, type, path: eventPath,
-                ...(event === 'create' && nodeDataForBroadcast && { node: nodeDataForBroadcast }),
+            const nodeToUpdate = await prisma.file.findUnique({
+                 where: { projectId_path: { projectId, path: dbPath } },
+                 select: { id: true, isDirectory: true } // Select isDirectory to avoid updating content for directories
             });
-            console.log(`[API Internal] Broadcasted 'fs-update' to room: ${containerId}`);
+            if (!nodeToUpdate) {
+                console.warn(`[API Internal] Node ${dbPath} not found for modify event. It might be a new file modified quickly.`);
+                // Optionally, treat as create if it doesn't exist, but ensure content is handled
+            } else {
+                if (nodeToUpdate.isDirectory) {
+                    await prisma.file.update({ where: { id: nodeToUpdate.id }, data: { updatedAt: new Date() }});
+                    console.log(`[API Internal] Updated timestamp for modified directory: ${dbPath}`);
+                } else {
+                    // For files, update timestamp AND set content to null to trigger lazy load by editor.
+                    await prisma.file.update({
+                        where: { id: nodeToUpdate.id },
+                        data: { updatedAt: new Date(), content: null }
+                    });
+                    console.log(`[API Internal] Updated timestamp and nulled content for modified file: ${dbPath}`);
+                }
+            }
+        } else {
+            console.warn(`[API Internal] Received unhandled event type: ${event} for path ${dbPath}`);
+        }
+
+        // --- 4. Broadcast Event via Socket.IO (using normalized dbPath) ---
+        if (event === 'create' || event === 'delete' || event === 'modify') {
+            io.to(fullContainerId).emit('fs-update', {
+                containerId: fullContainerId,
+                event,
+                type, // type from watcher event data ('file' or 'directory')
+                path: dbPath, // Use the normalized dbPath
+                // For 'create', send the newly created node data (with ISO dates and potentially null content)
+                ...(event === 'create' && fileSystemNodeForBroadcast && { node: fileSystemNodeForBroadcast }),
+            });
+            console.log(`[API Internal] Broadcasted 'fs-update' to room: ${fullContainerId} for event: ${event}, path: ${dbPath}`);
         }
         res.status(204).send();
+
     } catch (error: any) {
-        console.error(`[API Internal Error] Failed to process FS event for container ${containerId}:`, error);
+        console.error(`[API Internal Error] Failed to process FS event for container ${shortContainerId} (full: ${fullContainerId}), raw path ${rawEventPath} (DB path ${dbPath}):`, error);
         res.status(500).send('Internal Server Error');
     }
 });
+
 
 // --- Error Handling & Server Startup ---
 app.use((req: Request, res: Response) => { res.status(404).json({ message: 'Not Found' }); });

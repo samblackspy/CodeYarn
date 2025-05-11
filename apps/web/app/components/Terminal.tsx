@@ -17,7 +17,7 @@ interface TerminalProps {
 
 // Define the WebSocket connection URL (should match backend)
 // Use environment variables for flexibility
-const SOCKET_SERVER_URL = process.env.NEXT_PUBLIC_SOCKET_SERVER_URL || 'http://localhost:3001';
+const SOCKET_SERVER_URL = process.env.NEXT_PUBLIC_SOCKET_SERVER_URL || '';
 
 /**
  * Terminal component provides an interface for interacting with the container's shell
@@ -115,13 +115,20 @@ export default function Terminal({ containerId }: TerminalProps): JSX.Element {
 
     // --- WebSocket Connection ---
     term.writeln(`🔌 Connecting to container ${containerId}...`);
-    const socket = io(SOCKET_SERVER_URL, {
+    
+       const socket = io(SOCKET_SERVER_URL, {
+        path: '/socket.io/',
+        transports: ['websocket', 'polling'],
         reconnectionAttempts: 5,
-        reconnectionDelay: 3000,
-        // Add auth tokens here if needed later
+        reconnectionDelay: 1000,
+        timeout: 20000,
+        forceNew: false,
+        withCredentials: true
     });
     socketRef.current = socket;
-
+    
+    
+    
     socket.on('connect', () => {
         console.log(`[Socket.IO] Connected to server: ${socket.id}`);
         setIsConnected(true);

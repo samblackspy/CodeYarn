@@ -59,7 +59,7 @@ model Template {
   iconUrl       String?
   tags          String[] // Array of strings for tags
   dockerImage   String
-  sourceHostPath  String // Path to the source code on the host
+  sourceHostPath  String? // Path to the source code on the host
   repositoryUrl String?
   startCommand  String?
   defaultPort   Int

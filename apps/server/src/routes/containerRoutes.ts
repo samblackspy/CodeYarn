@@ -199,7 +199,7 @@ async function createFileRecordsFromContainer(
 async function populateWorkspaceAndCreateDbFilesImpl(
     container: Docker.Container,
     projectId: string,
-    template: Pick<Template, 'id'> & { sourceHostPath?: string }
+    template: Pick<Template, 'id'> & { sourceHostPath?: string | null }
 ): Promise<void> {
     console.log(`[WorkspacePopulation] Starting for project ${projectId}, template ${template.id}`);
     const containerId = container.id;
@@ -330,7 +330,8 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
                 HostConfig: {
                     Binds: [`${volumeName}:${process.env.CONTAINER_WORKSPACE || '/workspace'}`], AutoRemove: false,
                     PortBindings: template.defaultPort ? { [`${template.defaultPort}/tcp`]: [{ HostPort: '0' }] } : undefined,
-                },
+  ExtraHosts: ['host.docker.internal:host-gateway']
+  		},
                 Labels: { 'codeyarn.project.id': projectId, 'codeyarn.template.id': templateId },
                 Env: [`PROJECT_ID=${projectId}`, `NODE_ENV=development`, `PORT=${template.defaultPort}`, `WATCH_PATH=/workspace`, `BACKEND_HOST=${process.env.WATCHER_CALLBACK_HOST || 'host.docker.internal'}`, `BACKEND_PORT=${process.env.PORT || 3001}`, `BACKEND_ENDPOINT=/api/internal/filesystem-event`],
                 User: process.env.CONTAINER_USER || 'coder',
@@ -776,34 +777,67 @@ router.get('/:id/preview-details', async (req: Request, res: Response, next: Nex
 
         // Only provide details if the container is expected to be running or starting
         if (dbContainer.status !== 'RUNNING' && dbContainer.status !== 'CREATING') {
-             console.log(`[API Containers] Preview requested for non-running container ${id} (status: ${dbContainer.status})`);
-             return res.status(409).json({ // 409 Conflict might be appropriate
-                 message: `Container is not running (status: ${dbContainer.status})`,
-                 status: dbContainer.status
-             });
+            console.log(`[API Containers] Preview requested for non-running container ${id} (status: ${dbContainer.status})`);
+            return res.status(409).json({ // 409 Conflict might be appropriate
+                message: `Container is not running (status: ${dbContainer.status})`,
+                status: dbContainer.status
+            });
         }
 
         if (!dbContainer.hostPort) {
-             console.warn(`[API Containers] Preview requested for container ${id}, but hostPort is not set.`);
-             return res.status(409).json({
-                 message: 'Container is running but host port information is missing.',
-                 status: dbContainer.status
-             });
+            console.warn(`[API Containers] Preview requested for container ${id}, but hostPort is not set.`);
+            return res.status(409).json({
+                message: 'Container is running but host port information is missing.',
+                status: dbContainer.status
+            });
         }
 
-        // Determine the base URL. For local development, this is typically localhost.
-        // In production, this needs to be the publicly accessible address of the host
-        // running the Docker containers, or a proxy address.
-        // Use an environment variable for flexibility.
-        const previewBaseUrl = process.env.PREVIEW_BASE_URL || `http://localhost`; // Default to localhost
+        // --- VVVVV ADDED DEBUG LINES VVVVV ---
+        console.log('--- DEBUG START: Preview URL Generation ---');
+        console.log('req.protocol:', req.protocol); // Should be 'https' if trust proxy is working
+        console.log('req.hostname:', req.hostname); // Should be 'codeyarn.xyz' if trust proxy is working
+        console.log('req.headers.host:', req.headers.host); // Original Host header from Nginx
+        console.log('req.headers["x-forwarded-proto"]:', req.headers['x-forwarded-proto']); // Header from Nginx
+        console.log('req.headers["x-forwarded-host"]:', req.headers['x-forwarded-host']); // Alternative host header from Nginx
+        console.log('req.socket.remoteAddress:', req.socket.remoteAddress); // Should be Nginx's IP or ::1/127.0.0.1
+        console.log('--- DEBUG END: Preview URL Generation ---');
+        // --- ^^^^^ ADDED DEBUG LINES ^^^^^ ---
+
+        // Your existing logic to determine protocol and domain:
+        // Safely get the domain, ensuring it's always a string
+        // With 'trust proxy' set, req.hostname should ideally give the correct domain.
+        // req.headers.host might be what Nginx passed, which should be the original host.
+        const domain = req.hostname && req.hostname !== 'localhost' // Prefer req.hostname if available and not localhost
+            ? req.hostname
+            : (req.headers.host && typeof req.headers.host === 'string'
+                ? req.headers.host.split(':')[0]
+                : 'codeyarn.xyz'); // Fallback
+
+        // Extract protocol from request.
+        // With 'trust proxy' set, req.protocol should give the X-Forwarded-Proto value.
+        let protocol = req.protocol; // Directly use req.protocol
+
+        // Ensure it's a valid protocol, defaulting to https for safety if something is unexpected,
+        // especially if the domain is not localhost.
+        if (protocol !== 'http' && protocol !== 'https') {
+            protocol = 'https';
+        }
+        if (domain !== 'localhost' && protocol === 'http') { // Upgrade to https for the public domain
+             protocol = 'https';
+        }
+
+
+        // Use the domain directly without the API port
+        const previewUrl = `${protocol}://${domain}/preview/container/${dbContainer.hostPort}/`;
+
+        console.log(`[API Containers] Generated previewUrl: ${previewUrl}`); // Log the generated URL
 
         res.status(200).json({
             containerId: id,
             status: dbContainer.status,
             hostPort: dbContainer.hostPort,
             internalPort: dbContainer.internalPort,
-            // Construct the likely preview URL (frontend might adjust protocol/domain if needed)
-            previewUrl: `${previewBaseUrl}:${dbContainer.hostPort}`
+            previewUrl: previewUrl
         });
 
     } catch (error: any) {
@@ -811,7 +845,6 @@ router.get('/:id/preview-details', async (req: Request, res: Response, next: Nex
         next(error);
     }
 });
-
 /**
  * GET /api/containers/:id/file-status
  * Checks if files in the container have changed since the last check

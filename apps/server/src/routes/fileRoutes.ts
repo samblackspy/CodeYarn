@@ -37,7 +37,8 @@ async function execCmdInContainer(container: Docker.Container, cmd: string[], wo
             Cmd: cmd,
             AttachStdout: true,
             AttachStderr: true,
-            WorkingDir: workingDir
+            WorkingDir: workingDir,
+            Tty: false
         });
         const stream: Duplex = await exec.start({}); // Correctly await and type the stream
 
@@ -118,35 +119,100 @@ router.get('/:fileId/details', async (req: Request, res: Response, next: NextFun
  * GET /api/files/:fileId/content
  * Fetches the content of a specific file from the database.
  */
+/**
+ * GET /api/files/:fileId/content
+ * Fetches the content of a specific file.
+ * If content is null in DB (stale), fetches from container, updates DB, then returns.
+ */
+
 router.get('/:fileId/content', async (req: Request, res: Response, next: NextFunction) => {
     const { fileId } = req.params;
+
     if (typeof fileId !== 'string' || !fileId) {
-        return res.status(400).json({ message: 'Invalid file ID provided' });
+        return res.status(400).json({ error: 'Invalid file ID provided.' });
     }
-    console.log(`[API Files] Request received for content of file: ${fileId}`);
+    console.log(`[API Files GET /content] Request for fileId: ${fileId}`);
 
     try {
-        const fileRecord = await prisma.file.findUnique({
+        let fileRecord = await prisma.file.findUnique({
             where: { id: fileId },
-            select: { content: true, isDirectory: true, path: true }
+            select: { content: true, isDirectory: true, path: true, projectId: true }
         });
 
         if (!fileRecord) {
-            return res.status(404).json({ message: 'File not found in database' });
-        }
-        if (fileRecord.isDirectory) {
-            return res.status(400).json({ message: 'Cannot get content of a directory' });
+            return res.status(404).json({ error: 'File not found in database.' });
         }
 
-        console.log(`[API Files] Sending content for file: ${fileRecord.path}`);
+        if (fileRecord.isDirectory) {
+            return res.status(400).json({ error: 'Cannot get content of a directory.' });
+        }
+
+        let fileContent: string | null = fileRecord.content;
+
+        // If content is null in DB, try to fetch from container
+        if (fileContent === null) {
+            console.log(`[API Files GET /content] DB content for path "${fileRecord.path}" (ID: ${fileId}) is null. Attempting to fetch from container.`);
+            const project = await prisma.project.findUnique({
+                where: { id: fileRecord.projectId },
+                select: { containerId: true }
+            });
+
+            if (project?.containerId) {
+                const container = docker.getContainer(project.containerId);
+                try {
+                    await container.inspect(); // Check if container exists and is accessible
+
+                    let pathInContainer = fileRecord.path; // e.g., /index.js or /app/somefile.js
+                    // Construct absolute path within /workspace
+                    if (!pathInContainer.startsWith('/workspace/')) {
+                         pathInContainer = path.posix.join('/workspace', pathInContainer.replace(/^\//, ''));
+                    }
+                    pathInContainer = path.posix.normalize(pathInContainer);
+
+
+                    console.log(`[API Files GET /content] Fetching content from container ${project.containerId} for path ${pathInContainer}`);
+                    
+                    const execResult = await execCmdInContainer(container, ['cat', pathInContainer], '/'); // WorkingDir as / for absolute path
+
+                    if (execResult.success) {
+                        fileContent = execResult.stdout;
+                        console.log(`[API Files GET /content] Successfully fetched content for "${pathInContainer}" from container. Length: ${fileContent.length}`);
+                        
+                        // Update the database with the fresh content and new timestamp
+                        await prisma.file.update({
+                            where: { id: fileId },
+                            data: { content: fileContent, updatedAt: new Date() }
+                        });
+                    } else {
+                        console.error(`[API Files GET /content] Failed to 'cat' file "${pathInContainer}" from container. Stderr: ${execResult.stderr}`);
+                        // Keep fileContent as null or set to empty string to indicate fetch failure but prevent future fetches until next modification
+                        // Depending on desired behavior, you might want to set it to an empty string or keep it null.
+                        // Setting to empty string might be preferable if cat fails because file is empty (exit code 0) vs file not found (exit code non-zero).
+                        // The helper already returns stdout as empty if cat fails but exit code is 0.
+                        fileContent = ''; // Default to empty if cat fails to get content
+                    }
+                } catch (dockerError: any) {
+                    console.error(`[API Files GET /content] Docker error fetching content for "${fileRecord.path}" (container: ${project.containerId}):`, dockerError.message);
+                    fileContent = ''; // Default to empty on error
+                }
+            } else {
+                console.warn(`[API Files GET /content] No active container for project ${fileRecord.projectId} to fetch content for "${fileRecord.path}".`);
+                fileContent = ''; // Default to empty if no container
+            }
+        } else {
+            console.log(`[API Files GET /content] Serving cached content from DB for path "${fileRecord.path}" (ID: ${fileId})`);
+        }
+
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.status(200).send(fileRecord.content || '');
+        res.status(200).send(fileContent || ''); // Ensure we always send a string
 
     } catch (error: any) {
-        console.error(`[API Error] Failed to get content for file ${fileId}:`, error);
-        next(error);
+        console.error(`[API Error GET /content] Failed for fileId ${fileId}:`, error);
+        // Pass to Express error handler
+        next(error); 
     }
 });
+
 
 /**
  * PUT /api/files/:fileId/content
@@ -155,127 +221,98 @@ router.get('/:fileId/content', async (req: Request, res: Response, next: NextFun
  */
 router.put('/:fileId/content', async (req: Request, res: Response, next: NextFunction) => {
     const { fileId } = req.params;
-    const newContent = req.body;
+    const newContent = req.body; // This comes from app.use(express.text(...))
 
     if (typeof fileId !== 'string' || !fileId) {
-        return res.status(400).json({ message: 'Invalid file ID provided' });
+        return res.status(400).json({ error: 'Invalid file ID provided.' });
     }
     if (typeof newContent !== 'string') {
-         return res.status(400).json({ message: 'Invalid or missing file content in request body (expecting raw text)' });
+        return res.status(400).json({ error: 'Invalid or missing file content in request body (expecting raw text).' });
     }
 
-    console.log(`[API Files] Request received to update content for file: ${fileId}`);
+    console.log(`[API Files PUT /content] Request to update fileId: ${fileId}. Content length: ${newContent.length}`);
 
     try {
-        // --- 1. Find the file record in the database ---
         const fileRecord = await prisma.file.findUnique({
             where: { id: fileId },
             select: { path: true, isDirectory: true, projectId: true }
         });
 
         if (!fileRecord) {
-            return res.status(404).json({ message: 'File not found in database' });
+            return res.status(404).json({ error: 'File not found in database.' });
         }
         if (fileRecord.isDirectory) {
-            return res.status(400).json({ message: 'Cannot set content of a directory' });
+            return res.status(400).json({ error: 'Cannot set content of a directory.' });
         }
 
-        // --- 2. Update the content in the database ---
-        // Use a transaction to update content and get the updated timestamp atomically
-        const updatedFile = await prisma.file.update({
+        // --- 1. Update the content in the database ---
+        const updatedFileInDb = await prisma.file.update({
             where: { id: fileId },
-            data: { content: newContent },
-            select: { id: true, path: true, updatedAt: true, projectId: true } // Select needed fields including projectId
+            data: { content: newContent, updatedAt: new Date() },
+            select: { id: true, path: true, updatedAt: true, projectId: true }
         });
-        console.log(`[API Files] Updated content in DB for file: ${fileRecord.path}`);
+        console.log(`[API Files PUT /content] Updated content in DB for path: ${updatedFileInDb.path}`);
 
-        // --- 3. Sync the content to the running container (if any) ---
+        // --- 2. Sync the content to the running container (if any) ---
         const project = await prisma.project.findUnique({
-            where: { id: updatedFile.projectId }, // Use projectId from updatedFile
+            where: { id: updatedFileInDb.projectId },
             select: { containerId: true }
         });
 
         if (project?.containerId) {
-            const containerId = project.containerId;
-            console.log(`[API Files] Syncing content to container ${containerId} for file ${fileRecord.path}`);
+            const container = docker.getContainer(project.containerId);
             try {
-                const container = docker.getContainer(containerId);
-                const inspectData = await container.inspect();
+                await container.inspect(); // Check if container exists and is accessible
 
-                if (!inspectData.State.Running) {
-                     console.warn(`[API Files] Container ${containerId} is not running. Skipping file sync for ${fileRecord.path}.`);
-                } else {
-                    // Ensure the path is within /workspace
-                    let filePathInContainer = fileRecord.path;
-                    // If the path starts with /, but is not /workspace, prepend /workspace
-                    if (filePathInContainer.startsWith('/') && !filePathInContainer.startsWith('/workspace')) {
-                        // Remove leading slash to avoid double slash
-                        const pathWithoutLeadingSlash = filePathInContainer.substring(1);
-                        filePathInContainer = `/workspace/${pathWithoutLeadingSlash}`;
-                    }
-                    const escapedContent = newContent.replace(/'/g, "'\\''");
-                    // Ensure directory exists before writing
-                    const cmd = `mkdir -p "$(dirname "${filePathInContainer}")" && echo '${escapedContent}' > "${filePathInContainer}"`;
-
-                    console.log(`[API Files] Executing sync command in ${containerId}: sh -c "echo ... > ${filePathInContainer}"`);
-
-                    const exec = await container.exec({
-                        Cmd: ['sh', '-c', cmd],
-                        AttachStdout: true, AttachStderr: true, WorkingDir: '/workspace'
-                    });
-
-                    const startOptions: Docker.ExecStartOptions = {};
-                    const stream: Duplex = await exec.start(startOptions);
-
-                    let execError = '';
-                    const errorStream = new PassThrough();
-                    errorStream.on('data', chunk => execError += chunk.toString());
-                    // Only demux stderr, ignore stdout for this command
-                    container.modem.demuxStream(stream, process.stdout, errorStream); // Pipe stdout to server logs for debug if needed
-
-                    await new Promise<void>((resolve, reject) => {
-                        stream.on('end', () => {
-                            if (execError) {
-                                console.error(`[API Files] Error output during file sync for ${filePathInContainer} to container ${containerId}: ${execError}`);
-                            } else {
-                                console.log(`[API Files] Successfully synced file ${filePathInContainer} to container ${containerId}`);
-                            }
-                            resolve();
-                        });
-                        stream.on('error', (err: Error) => {
-                            console.error(`[API Files] Stream error during file sync for ${filePathInContainer}:`, err);
-                            reject(err);
-                        });
-                    });
-
-                    // Optional: Check exit code
-                    const execInspect = await exec.inspect();
-                    if (execInspect.ExitCode !== 0) {
-                        console.error(`[API Files] Sync command exited with code ${execInspect.ExitCode} for file ${filePathInContainer}. Stderr: ${execError}`);
-                    }
+                let filePathInContainer = updatedFileInDb.path; // Path from DB, e.g., /index.js
+                // Construct absolute path within /workspace
+                if (!filePathInContainer.startsWith('/workspace/')) {
+                     filePathInContainer = path.posix.join('/workspace', filePathInContainer.replace(/^\//, ''));
                 }
+                filePathInContainer = path.posix.normalize(filePathInContainer);
 
+                // Escape content for shell 'echo'. This is basic.
+                // For complex content, writing via a temporary file and `mv` or using `putArchive` is more robust.
+                const escapedContent = newContent.replace(/'/g, "'\\''"); // Escapes single quotes for 'sh -c echo'
+                
+                // Command to ensure directory exists and then write file content
+                // Using printf is generally safer than echo for arbitrary content
+                const dirnameForCmd = path.posix.dirname(filePathInContainer);
+                const cmd = `mkdir -p '${dirnameForCmd}' && printf '%s' '${escapedContent}' > '${filePathInContainer}'`;
+                
+                console.log(`[API Files PUT /content] Executing sync command in container ${project.containerId} for path ${filePathInContainer}`);
+                
+                const execResult = await execCmdInContainer(container, ['sh', '-c', cmd], '/'); // WorkingDir as / for absolute paths
+
+                if (execResult.success) {
+                    console.log(`[API Files PUT /content] Successfully synced file ${filePathInContainer} to container.`);
+                } else {
+                    console.error(`[API Files PUT /content] Failed to sync file ${filePathInContainer} to container. Stderr: ${execResult.stderr}`);
+                    // Note: DB was already updated. Client will get a success response.
+                    // Consider how to signal this sync failure to the client if critical.
+                }
             } catch (dockerError: any) {
-                console.error(`[API Error] Failed to sync file ${fileRecord.path} to container ${containerId}:`, dockerError);
+                console.error(`[API Files PUT /content] Docker error syncing to container ${project.containerId} for path ${fileRecord.path}:`, dockerError.message);
+                // DB is updated. Client still gets success from DB update.
             }
         } else {
-             console.log(`[API Files] No active container found for project ${updatedFile.projectId}. Skipping file sync for ${fileRecord.path}.`);
+            console.log(`[API Files PUT /content] No active container for project ${updatedFileInDb.projectId}. Skipping file sync for ${updatedFileInDb.path}.`);
         }
 
-        // --- 4. Respond to Client ---
+        // --- 3. Respond to Client ---
         res.status(200).json({
-            message: 'File content updated successfully',
-            fileId: updatedFile.id,
-            path: updatedFile.path,
-            // Send back the actual updated timestamp from the database
-            updatedAt: updatedFile.updatedAt.toISOString(),
+            message: 'File content updated successfully in database.', // Clarify that DB update was the primary success
+            fileId: updatedFileInDb.id,
+            path: updatedFileInDb.path,
+            updatedAt: updatedFileInDb.updatedAt.toISOString(),
         });
 
     } catch (error: any) {
-        console.error(`[API Error] Failed to update content for file ${fileId}:`, error);
+        console.error(`[API Error PUT /content] Failed for fileId ${fileId}:`, error);
         next(error);
     }
 });
+
 
 
 
@@ -423,13 +460,21 @@ router.delete('/:fileId', async (req: Request, res: Response, next: NextFunction
         });
 
         // --- Attempt to Delete in Container ---
-         const project = await prisma.project.findUnique({ where: { id: deletedNode.projectId }, select: { containerId: true } });
+
+ const project = await prisma.project.findUnique({ where: { id: deletedNode.projectId }, select: { containerId: true } });
          if (project?.containerId) {
              const container = await getContainerSafely(project.containerId);
              if (container) {
                   const inspectData = await container.inspect();
                   if (inspectData.State.Running) {
-                     const cmd = ['rm', '-rf', deletedNode.path]; // Force recursive delete
+                     // Make sure path is relative to workspace or is fully workspace-prefixed
+                  const filePath = deletedNode.path.startsWith('/workspace/') 
+                      ? deletedNode.path // Already has workspace prefix
+                      : (deletedNode.path.startsWith('/') 
+                          ? `/workspace${deletedNode.path}` // Add workspace prefix to absolute path
+                          : `/workspace/${deletedNode.path}`); // Add workspace prefix to relative path
+                  console.log(`[API Files] Normalized deletion path from ${deletedNode.path} to ${filePath}`);
+                  const cmd = ['rm', '-rf', filePath]; // Force recursive delete
                      const { success } = await execCmdInContainer(container, cmd);
                      if (!success) {
                          console.warn(`[API Files] Failed to delete ${deletedNode.path} in container ${project.containerId}, but DB record(s) deleted.`);
@@ -439,6 +484,7 @@ router.delete('/:fileId', async (req: Request, res: Response, next: NextFunction
                   } else { console.warn(`Container ${project.containerId} not running, skipping container deletion.`); }
              }
          }
+
 
         // --- Respond ---
         // Use count from DB operation (deleteResult is not available outside transaction)

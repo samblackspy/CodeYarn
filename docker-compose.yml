@@ -1,27 +1,48 @@
-# docker-compose.yml
-version: '3.8'
+# No top-level 'version:' tag needed for modern Docker Compose
 
 services:
-  # PostgreSQL Database Service
+  # Your other services (nginx, server, web) would also be defined here...
+
   postgres-db:
-    image: postgres:15-alpine
+    image: postgres:${POSTGRES_VERSION:-15-alpine} # Uses .env value, with a default
     container_name: codeyarn-postgres-db
     ports:
-      - "5432:5432"
+      - "${POSTGRES_HOST_PORT:-5432}:5432" # Maps to host, uses .env value
     environment:
-      POSTGRES_USER: codeyarn_user
-      POSTGRES_PASSWORD: codeyarn_password
-      POSTGRES_DB: codeyarn_db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD} # Critical: Use a strong, unique password
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - ${POSTGRES_DATA_VOLUME}:/var/lib/postgresql/data # Persistent data
+      # Conditionally mount init script if the path is set in .env and file exists
+      # Or simply keep your direct mount if you always want it:
+      - ${POSTGRES_INIT_SCRIPT}:/docker-entrypoint-initdb.d/init.sh # Make sure this script is robust
+      # Example for custom postgresql.conf (optional, create the file first)
+      # - ./custom-postgres/postgresql.conf:/etc/postgresql/postgresql.conf
+      # - ./custom-postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf
+    networks:
+      - codeyarn-network # Ensure this network is defined below
     healthcheck:
+      # Test uses environment variables from inside the container
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    # Optional: Add logging configuration if needed
+    # logging:
+    #   driver: "json-file"
+    #   options:
+    #     max-size: "10m"
+    #     max-file: "3"
 
-# Define named volume for data persistence
 volumes:
-  postgres-data:
+  # Define the named volume for data persistence
+  # The name here must match what's used in services.postgres-db.volumes
+  # e.g., if using ${POSTGRES_DATA_VOLUME} above, it will be codeyarn_postgres-data
+  codeyarn_postgres-data: # Matches the default in .env example
     driver: local
+
+networks:
+  codeyarn-network:
+    driver: bridge

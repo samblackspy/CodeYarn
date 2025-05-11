@@ -18,15 +18,17 @@ const nextConfig = {
   
   async rewrites() {
     if (process.env.NODE_ENV === 'production') {
-      // In production, Nginx handles proxying to the backend service.
-      // No explicit rewrites are needed here for API/Socket.io if Next.js app
-      // makes relative requests (e.g., /api/..., /socket.io/...)
-      // and NEXT_PUBLIC_API_BASE_URL is set to '/' or similar if needed by client-side code.
       return [
-        // Add any other production-specific, non-API/Socket.io rewrites if necessary
+        {
+          source: '/api/:path*',
+          destination: `${process.env.NEXT_PUBLIC_API_BASE_URL}/api/:path*`,
+        },
+        {
+          source: '/socket.io/:path*',
+          destination: `${process.env.NEXT_PUBLIC_API_BASE_URL}/socket.io/:path*`,
+        },
       ];
     } else {
-      // Development rewrites: proxy to local backend server
       return [
         {
           source: '/api/:path*',
@@ -40,13 +42,10 @@ const nextConfig = {
     }
   },
 
-  // Optional: If you need to expose the server's hostname/port to the client-side
-  // in a way that's consistent with Docker's internal networking for SSR, but
-  // also works for client-side fetches that go through Nginx.
-  // publicRuntimeConfig: {
-  //   apiBaseUrl: process.env.NODE_ENV === 'production' ? '/api' : 'http://localhost:3001/api',
-  //   socketIoPath: process.env.NODE_ENV === 'production' ? '/socket.io' : 'http://localhost:3001/socket.io',
-  // },
+  publicRuntimeConfig: {
+    apiBaseUrl: process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:3001',
+  },
 };
 
 module.exports = nextConfig;
+

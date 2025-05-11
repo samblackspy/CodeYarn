@@ -7,7 +7,7 @@ import { cn } from '@/lib/utils';
 import { io, Socket } from 'socket.io-client'; // Import socket.io client
 
 // Define the WebSocket connection URL (should match backend)
-const SOCKET_SERVER_URL = process.env.NEXT_PUBLIC_SOCKET_SERVER_URL || 'http://localhost:3001';
+const SOCKET_SERVER_URL = process.env.NEXT_PUBLIC_SOCKET_SERVER_URL || '';
 
 // Define props (containerId is essential)
 interface PreviewProps {
@@ -113,13 +113,26 @@ export default function Preview({ containerId }: PreviewProps): JSX.Element {
       return;
     }
 
-    // Create socket connection if it doesn't exist
-    if (!socketRef.current) {
-      console.log(`[Preview] Creating socket connection for container: ${containerId}`);
-      const socket = io(SOCKET_SERVER_URL);
-      socketRef.current = socket;
 
+
+    // Create socket connection if it doesn't exist
+      if (!socketRef.current) {
+      console.log(`[Preview] Creating socket connection for container: ${containerId}`);
+      const socket = io('', {
+        path: '/socket.io/',
+        transports: ['websocket', 'polling'],
+        reconnectionAttempts: 5,
+        reconnectionDelay: 1000,
+        timeout: 20000,
+        forceNew: false,
+        withCredentials: true
+      });
+      socketRef.current = socket;
+    
+    
       // Connect to the container
+    
+    
       socket.on('connect', () => {
         console.log(`[Preview] Socket connected: ${socket.id}`);
         socket.emit('register-container', containerId);

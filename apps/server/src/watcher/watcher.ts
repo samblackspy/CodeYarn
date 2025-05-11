@@ -19,7 +19,22 @@ const BACKEND_HOST = process.env.BACKEND_HOST || 'host.docker.internal';
 const BACKEND_PORT = parseInt(process.env.BACKEND_PORT || '3001', 10); // Port the main backend server is listening on
 const BACKEND_ENDPOINT = process.env.BACKEND_ENDPOINT || '/api/internal/filesystem-event';
 const CONTAINER_ID = process.env.CONTAINER_ID;
-const EXCLUDE_PATTERN = process.env.EXCLUDE_PATTERN || '^(/workspace/node_modules|/workspace/\.git|/workspace/\.next)';
+
+const DEFAULT_EXCLUDE_PATTERN = '^(' +
+    '/workspace/node_modules|' +
+    '/workspace/\\.git|' +
+    '/workspace/\\.next|' +
+    '/workspace/\\.npm|' +        // For .npm
+    '/workspace/\\.pnpm-store|' +
+    '/workspace/\\.bash_history|' + // For .bash_history
+    '/workspace/\\.ash_history|' +  // For .ash_history
+    '/workspace/build|' +
+    '/workspace/dist|' +
+    '/workspace/\\.cache' +
+')';
+
+const EXCLUDE_PATTERN = process.env.EXCLUDE_PATTERN || DEFAULT_EXCLUDE_PATTERN;
+
 
 if (!CONTAINER_ID) {
     console.error('[Watcher Error] CONTAINER_ID environment variable is not set. Exiting.');
@@ -83,9 +98,10 @@ function startInotifywait() {
         WATCH_PATH
     ];
 
-    if (EXCLUDE_PATTERN) {
-        args.splice(args.length - 1, 0, '--exclude', EXCLUDE_PATTERN);
-    }
+if (EXCLUDE_PATTERN) {
+    args.splice(args.length - 1, 0, '--exclude', EXCLUDE_PATTERN);
+    console.log(`[CodeYarn Watcher] Effective Exclude Pattern for inotifywait: ${EXCLUDE_PATTERN}`);
+}
 
     const watcherProcess = spawn('inotifywait', args);
 
