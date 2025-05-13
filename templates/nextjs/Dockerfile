@@ -58,6 +58,9 @@ RUN chown -R coder:coder /workspace
 # This makes the ENTRYPOINT and CMD run as 'coder'.
 # Also, terminal sessions opened via 'docker exec' will default to 'coder'.
 USER coder
+WORKDIR /workspace
+
+RUN npm install
 
 # --- NO 'npm install' or 'npm ci' during build ---
 # This step is now skipped. The user will run it manually.

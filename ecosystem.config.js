@@ -10,7 +10,7 @@ module.exports = {
       exec_mode: 'cluster',
       env: {
         NODE_ENV: 'production',
-        DATABASE_URL: "postgresql://codeyarn_user:your_strong_secret_password@localhost:5432/codeyarn_db?schema=public",
+        DATABASE_URL: "postgresql://codeyarn_user:we11s9fkA6Es0kN0xD55osA13CVxRu8vbI3nvtfpp27Lvesas5@localhost:5432/codeyarn_db?schema=public",
 },
     },
     {

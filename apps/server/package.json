@@ -20,6 +20,7 @@
     "dockerode": "^4.0.2",
     "express": "^4.19.2",
     "fs-extra": "^11.3.0",
+    "portfinder": "^1.0.37",
     "socket.io": "^4.7.5",
     "tar-fs": "^3.0.8"
   },

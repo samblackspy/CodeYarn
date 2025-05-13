@@ -7,6 +7,7 @@ import fs from 'fs-extra';
 import path from 'path';
 import tar from 'tar-fs';
 import { Duplex, Readable, PassThrough } from 'stream';
+import portfinder from 'portfinder';
 
 // Define a type for the global file watch map
 declare global {
@@ -231,246 +232,254 @@ async function populateWorkspaceAndCreateDbFilesImpl(
  * Creates or retrieves an existing container for a project.
  * Populates workspace from template if creating for the first time for this project.
  */
+
+
 router.post('/', async (req: Request, res: Response, next: NextFunction) => {
     const { projectId, templateId } = req.body;
 
-    if (!projectId || typeof projectId !== 'string') return res.status(400).json({ message: 'Missing or invalid projectId' });
-    if (!templateId || typeof templateId !== 'string') return res.status(400).json({ message: 'Missing or invalid templateId' });
+    if (!projectId || typeof projectId !== 'string') {
+        return res.status(400).json({ message: 'Missing or invalid projectId' });
+    }
+    if (!templateId || typeof templateId !== 'string') {
+        return res.status(400).json({ message: 'Missing or invalid templateId' });
+    }
 
-    console.log(`[API Containers] Request to get/create container for project ${projectId} from template ${templateId}`);
-    let createdOrFoundDockerContainerId: string | null = null;
+    console.log(`[API Containers] Request: Project ${projectId}, Template ${templateId}`);
+    let wasNewContainerActuallyCreated = false; // Renamed for clarity
+    let containerIdForCleanup: string | null = null; // For potential cleanup in main catch
 
     try {
         const project = await prisma.project.findUnique({
             where: { id: projectId },
             select: { id: true, name: true, templateId: true, containerId: true }
         });
-        if (!project) return res.status(404).json({ message: 'Project not found' });
-        if (project.templateId && project.templateId !== templateId) {
-             // This might be too strict if a project could change templates, but for initial creation it's a good check.
-            console.warn(`[API Containers] Template ID mismatch for project ${projectId}. Requested: ${templateId}, Project has: ${project.templateId}`);
-            // For now, we allow proceeding, assuming the request's templateId is the desired one for this operation.
-            // Consider if this should be an error.
+
+        if (!project) {
+            return res.status(404).json({ message: 'Project not found' });
         }
 
         const template = await prisma.template.findUnique({
             where: { id: templateId },
-            select: { id: true, name: true, dockerImage: true, sourceHostPath: true, startCommand: true, defaultPort: true } // Ensure all needed fields are selected
+            select: { id: true, name: true, dockerImage: true, sourceHostPath: true, startCommand: true, defaultPort: true }
         });
-        if (!template || !template.dockerImage) return res.status(404).json({ message: 'Template not found or dockerImage not specified' });
-        console.log(`[API Containers] Using template: ${template.name} with dockerImage: ${template.dockerImage}`);
-        console.log(`[API Containers] Using template: ${template.name} with startCommand: ${template.startCommand}`);
-        console.log(`[API Containers] Using template: ${template.name} with defaultPort: ${template.defaultPort}`);
-        console.log(`[API Containers] Using template: ${template.name} with sourceHostPath: ${template.sourceHostPath}`);
+
+        if (!template || !template.dockerImage) {
+            return res.status(404).json({ message: 'Template not found or dockerImage not specified.' });
+        }
+        if (!template.defaultPort) {
+            return res.status(400).json({ message: `Template ${templateId} is missing defaultPort.` });
+        }
+        console.log(`[API Containers] Using Template: ${template.name}, Image: ${template.dockerImage}, StartCmd: ${template.startCommand}, Port: ${template.defaultPort}, SourcePath: ${template.sourceHostPath}`);
+
         let dbContainerRecord = await prisma.container.findUnique({
-            where: { projectId: projectId }, // Assuming your schema has @unique on projectId for Container
+            where: { projectId: projectId },
             select: { id: true, status: true, hostPort: true, internalPort: true, projectId: true, templateId: true, createdAt: true, startedAt: true, stoppedAt: true }
         });
 
-        let dockerContainerInfo: Docker.ContainerInspectInfo | null = null;
         let dockerContainerInstance: Docker.Container | null = null;
-        let needsWorkspacePopulation = !dbContainerRecord; // Populate if no DB record exists (implies new setup for this project)
+        let finalHostPortToUseInResponse: number | null = null;
 
-        if (dbContainerRecord && dbContainerRecord.id) { // Use dbContainerRecord.id (Docker ID as PK)
-            console.log(`[API Containers] Found existing DB record for container (Docker ID): ${dbContainerRecord.id} for project ${projectId}`);
-            dockerContainerInstance = await getDockerContainerInstance(dbContainerRecord.id); // Use Docker ID
+        if (dbContainerRecord && dbContainerRecord.id) {
+            containerIdForCleanup = dbContainerRecord.id; // Existing container ID for potential cleanup
+            console.log(`[API Containers] Existing DB container record found: ${dbContainerRecord.id}. Verifying Docker state.`);
+            dockerContainerInstance = await getDockerContainerInstance(dbContainerRecord.id);
 
             if (dockerContainerInstance) {
-                dockerContainerInfo = await dockerContainerInstance.inspect();
-                createdOrFoundDockerContainerId = dockerContainerInfo.Id;
-                if (!dockerContainerInfo.State.Running) {
-                    console.log(`[API Containers] Existing Docker container ${dbContainerRecord.id} is not running. Attempting to start...`);
+                let inspectInfo = await dockerContainerInstance.inspect();
+                finalHostPortToUseInResponse = dbContainerRecord.hostPort; // Trust DB for existing
+
+                if (templateId !== dbContainerRecord.templateId) {
+                    console.warn(`[API Containers] Template ID mismatch for existing container (Project: ${projectId}, Old: ${dbContainerRecord.templateId}, New: ${templateId}). Removing old container to recreate.`);
+                    await dockerContainerInstance.remove({ force: true }).catch(e => console.error(`[API Containers] Failed to remove container for template change: ${e.message}`));
+                    await prisma.container.delete({ where: { id: dbContainerRecord.id }});
+                    dbContainerRecord = null; // Force recreation
+                    dockerContainerInstance = null; // Nullify instance
+                } else if (!inspectInfo.State.Running) {
+                    console.log(`[API Containers] Existing container ${dbContainerRecord.id} is stopped. Starting...`);
                     try {
                         await dockerContainerInstance.start();
-                        dockerContainerInfo = await dockerContainerInstance.inspect();
-                        console.log(`[API Containers] Started existing Docker container ${dbContainerRecord.id}`);
-                        if (dbContainerRecord.status !== 'RUNNING') {
+                        inspectInfo = await dockerContainerInstance.inspect(); // Re-inspect
+                        console.log(`[API Containers] Started existing container ${dbContainerRecord.id}.`);
+                        if (dbContainerRecord.status !== 'RUNNING' || !inspectInfo.State.StartedAt) {
                             dbContainerRecord = await prisma.container.update({
                                 where: { id: dbContainerRecord.id },
-                                data: { status: 'RUNNING', startedAt: new Date() },
+                                data: { status: 'RUNNING', startedAt: new Date(inspectInfo.State.StartedAt) },
                                 select: { id: true, status: true, hostPort: true, internalPort: true, projectId: true, templateId: true, createdAt: true, startedAt: true, stoppedAt: true }
                             });
                         }
                     } catch (startError: any) {
-                        console.error(`[API Containers] Failed to start existing Docker container ${dbContainerRecord.id}:`, startError.message);
-                        await dockerContainerInstance.remove({ force: true }).catch(e => console.error(`Cleanup failed for non-starting container ${dockerContainerInstance?.id}`, e));
-                        dockerContainerInstance = null; dockerContainerInfo = null;
+                        console.error(`[API Containers] Failed to start existing container ${dbContainerRecord.id}: ${startError.message}. Removing & recreating.`);
+                        await dockerContainerInstance.remove({ force: true }).catch(e => console.error(`[API Containers] Cleanup failed for non-starting container ${dockerContainerInstance?.id}: ${e.message}`));
                         await prisma.container.delete({ where: { id: dbContainerRecord.id }});
-                        dbContainerRecord = null; needsWorkspacePopulation = true;
+                        dbContainerRecord = null;
+                        dockerContainerInstance = null;
                     }
                 }
             } else {
-                console.warn(`[API Containers] DB record for container ${dbContainerRecord.id} exists, but Docker container not found. Will recreate.`);
+                console.warn(`[API Containers] DB record for ${dbContainerRecord.id} exists, but Docker container not found. Cleaning DB, will recreate.`);
                 await prisma.container.delete({ where: { id: dbContainerRecord.id }});
-                dbContainerRecord = null; needsWorkspacePopulation = true;
+                dbContainerRecord = null;
             }
         }
 
         if (!dbContainerRecord) {
-            console.log(`[API Containers] No usable existing container found for project ${projectId}. Creating new Docker container...`);
+            wasNewContainerActuallyCreated = true;
+            console.log(`[API Containers] Creating new container for project ${projectId}.`);
+            
+            let allocatedHostPort: number;
+            try {
+                portfinder.basePort = 32000;
+                allocatedHostPort = await portfinder.getPortPromise();
+                console.log(`[API Containers] Allocated hostPort via portfinder: ${allocatedHostPort}`);
+            } catch (portError: any) {
+                console.error(`[API Containers] Portfinder error for project ${projectId}:`, portError.message);
+                return next(new Error('Could not allocate a free port.'));
+            }
+            
+            finalHostPortToUseInResponse = allocatedHostPort;
+
             const volumeName = `codeyarn-vol-${projectId}`;
             try {
                 await docker.createVolume({ Name: volumeName });
-                console.log(`[API Containers] Created volume: ${volumeName}`);
             } catch (volumeError: any) {
-                if (volumeError.statusCode !== 409) throw volumeError;
-                console.log(`[API Containers] Volume ${volumeName} already exists.`);
+                if (volumeError.statusCode !== 409) { // 409 is "conflict"/already exists
+                    console.error(`[API Containers] Error creating volume ${volumeName}:`, volumeError.message);
+                    return next(new Error(`Volume creation failed: ${volumeError.message}`));
+                }
             }
+            console.log(`[API Containers] Ensured volume exists: ${volumeName}`);
 
             const containerName = `codeyarn-session-${projectId}`;
             const existingNamedContainer = await getDockerContainerInstance(containerName);
             if (existingNamedContainer) {
-                console.warn(`[API Containers] Removing existing Docker container named ${containerName}.`);
-                await existingNamedContainer.remove({ force: true }).catch(e => console.error(`Failed to remove existing untracked container ${containerName}`, e));
+                console.warn(`[API Containers] Removing existing container with conflicting name ${containerName}.`);
+                await existingNamedContainer.remove({ force: true }).catch(e => console.error(`[API Containers] Failed to remove conflicting container ${containerName}: ${e.message}`));
             }
-
+            
+            const assetPrefix = `/preview/container/${finalHostPortToUseInResponse}`;
+            console.log(`[API Containers] Setting ASSET_PREFIX: ${assetPrefix}`);
+            
             const containerOptions: Docker.ContainerCreateOptions = {
                 Image: template.dockerImage, name: containerName, Tty: true, AttachStdin: false, AttachStdout: true, AttachStderr: true, OpenStdin: false,
                 WorkingDir: process.env.CONTAINER_WORKSPACE || '/workspace',
                 HostConfig: {
-                    Binds: [`${volumeName}:${process.env.CONTAINER_WORKSPACE || '/workspace'}`], AutoRemove: false,
-                    PortBindings: template.defaultPort ? { [`${template.defaultPort}/tcp`]: [{ HostPort: '0' }] } : undefined,
-  ExtraHosts: ['host.docker.internal:host-gateway']
-  		},
+                    Binds: [`${volumeName}:${process.env.CONTAINER_WORKSPACE || '/workspace'}`],
+                    AutoRemove: false,
+                    PortBindings: template.defaultPort ? { [`${template.defaultPort}/tcp`]: [{ HostPort: finalHostPortToUseInResponse.toString() }] } : undefined,
+                    ExtraHosts: ['host.docker.internal:host-gateway']
+                },
                 Labels: { 'codeyarn.project.id': projectId, 'codeyarn.template.id': templateId },
-                Env: [`PROJECT_ID=${projectId}`, `NODE_ENV=development`, `PORT=${template.defaultPort}`, `WATCH_PATH=/workspace`, `BACKEND_HOST=${process.env.WATCHER_CALLBACK_HOST || 'host.docker.internal'}`, `BACKEND_PORT=${process.env.PORT || 3001}`, `BACKEND_ENDPOINT=/api/internal/filesystem-event`],
+                Env: [
+                    `PROJECT_ID=${projectId}`, `NODE_ENV=development`, `PORT=${template.defaultPort}`,
+                    `WATCH_PATH=/workspace`, `BACKEND_HOST=${process.env.WATCHER_CALLBACK_HOST || 'host.docker.internal'}`,
+                    `BACKEND_PORT=${process.env.PORT || 3001}`, `BACKEND_ENDPOINT=/api/internal/filesystem-event`,
+                    `ASSET_PREFIX=${assetPrefix}`, `NEXT_PUBLIC_ASSET_PREFIX=${assetPrefix}`
+                ],
                 User: process.env.CONTAINER_USER || 'coder',
-                // Handle shell commands specially to avoid incorrect splitting
-                Cmd: template.startCommand ? 
-                    (template.startCommand.startsWith('/bin/') ? [template.startCommand] : template.startCommand.split(' ')) 
-                    : undefined,
+                Cmd: template.startCommand ? (template.startCommand.startsWith('/') ? [template.startCommand] : template.startCommand.split(' ')) : undefined,
             };
 
-            const newDockerContainerInstance = await docker.createContainer(containerOptions);
-            createdOrFoundDockerContainerId = newDockerContainerInstance.id;
-            
-            await newDockerContainerInstance.start();
-            dockerContainerInfo = await newDockerContainerInstance.inspect();
-            console.log(`[API Containers] New Docker container created and started: ${dockerContainerInfo.Id} with start command: ${template.startCommand}`);
+            try {
+                dockerContainerInstance = await docker.createContainer(containerOptions);
+                containerIdForCleanup = dockerContainerInstance.id; // Set for potential cleanup in main catch
+                await dockerContainerInstance.start();
+                const inspectInfo = await dockerContainerInstance.inspect();
+                console.log(`[API Containers] New container ${inspectInfo.Id} started. Requested HostPort: ${finalHostPortToUseInResponse}.`);
 
-            if (needsWorkspacePopulation) {
-                // Pass only the needed properties to populateWorkspaceAndCreateDbFilesImpl
-                await populateWorkspaceAndCreateDbFilesImpl(newDockerContainerInstance, projectId, {
+                // Verify actual bound port matches requested port
+                const internalPortKey = template.defaultPort ? `${template.defaultPort}/tcp` : undefined;
+                const portBindingsFromInspect = inspectInfo.NetworkSettings.Ports;
+                let actualBoundHostPort: number | null = null;
+                if (internalPortKey && portBindingsFromInspect && portBindingsFromInspect[internalPortKey]?.[0]?.HostPort) {
+                    actualBoundHostPort = parseInt(portBindingsFromInspect[internalPortKey][0].HostPort);
+                }
+                if (actualBoundHostPort !== finalHostPortToUseInResponse) {
+                    const portMismatchError = `CRITICAL PORT MISMATCH: Requested ${finalHostPortToUseInResponse}, Docker bound to ${actualBoundHostPort}. ASSET_PREFIX will be incorrect.`;
+                    console.error(`[API Containers] ${portMismatchError}`);
+                    await dockerContainerInstance.remove({ force: true }).catch(e => console.error(`[API Containers] Cleanup failed for misconfigured container ${containerIdForCleanup}: ${e.message}`));
+                    return next(new Error(portMismatchError)); 
+                }
+
+            } catch (creationError: any) {
+                 console.error(`[API Containers] Error creating/starting container for project ${projectId}: ${creationError.message}`, creationError);
+                 if (dockerContainerInstance && containerIdForCleanup) { // If create succeeded but start/inspect failed
+                    await dockerContainerInstance.remove({ force: true }).catch(e => console.error(`[API Containers] Cleanup attempt failed for container ${containerIdForCleanup}: ${e.message}`));
+                 }
+                 return next(new Error(`Container creation/start failed: ${creationError.message}`));
+            }
+            
+            // populateWorkspaceAndCreateDbFilesImpl handles its own console logs
+            if (dockerContainerInstance) {
+                 await populateWorkspaceAndCreateDbFilesImpl(dockerContainerInstance, projectId, {
                     id: template.id,
-                    sourceHostPath: template.sourceHostPath
+                    sourceHostPath: template.sourceHostPath // Will be null for Next.js/node-basic
                 });
+            } else {
+                // Should have been caught by error handling above
+                throw new Error("Docker container instance was not available for workspace population.");
             }
 
-            const portBindings = dockerContainerInfo.NetworkSettings.Ports;
-            const internalPortKey = template.defaultPort ? `${template.defaultPort}/tcp` : undefined;
-            
-            // Check if port binding exists and extract host port
-            let hostPort = null;
-            if (internalPortKey && portBindings && portBindings[internalPortKey] && portBindings[internalPortKey]?.length > 0) {
-                const portMapping = portBindings[internalPortKey]?.[0];
-                if (portMapping && portMapping.HostPort) {
-                    hostPort = parseInt(portMapping.HostPort);
-                    console.log(`[API Containers] Extracted host port ${hostPort} for container ${dockerContainerInfo.Id}`);
-                }
-            }
-            
-            // If no port binding found but a default port is specified, use a random port
-            if (hostPort === null && template.defaultPort) {
-                // Use dynamic port allocation by Docker
-                try {
-                    // Update port bindings with a dynamic port
-                    await newDockerContainerInstance.update({
-                        HostConfig: {
-                            PortBindings: { [`${template.defaultPort}/tcp`]: [{ HostPort: '' }] }
-                        }
-                    });
-                    
-                    // Restart container to apply port changes
-                    await newDockerContainerInstance.restart();
-                    
-                    // Get updated container info
-                    dockerContainerInfo = await newDockerContainerInstance.inspect();
-                    
-                    // Try to get the port again
-                    const updatedPortBindings = dockerContainerInfo.NetworkSettings.Ports;
-                    if (internalPortKey && updatedPortBindings && updatedPortBindings[internalPortKey]?.[0]?.HostPort) {
-                        hostPort = parseInt(updatedPortBindings[internalPortKey][0].HostPort);
-                        console.log(`[API Containers] Successfully allocated dynamic port ${hostPort} for container ${dockerContainerInfo.Id}`);
-                    }
-                } catch (portUpdateError) {
-                    console.error(`[API Containers] Failed to allocate dynamic port: ${portUpdateError}`);
-                }
-            }
-
+            const finalInspectInfo = await docker.getContainer(containerIdForCleanup!).inspect();
             const containerDataForDb = {
-                id: dockerContainerInfo.Id, // Docker ID as PK
-                status: (dockerContainerInfo.State.Running ? 'RUNNING' : dockerContainerInfo.State.Status) as ContainerStatus,
-                hostPort: hostPort,
-                internalPort: template.defaultPort || 0,
+                id: finalInspectInfo.Id,
+                status: (finalInspectInfo.State.Running ? 'RUNNING' : finalInspectInfo.State.Status.toUpperCase()) as ContainerStatus,
+                hostPort: finalHostPortToUseInResponse,
+                internalPort: template.defaultPort,
                 projectId: projectId,
                 templateId: templateId,
-                startedAt: dockerContainerInfo.State.Running ? new Date(dockerContainerInfo.State.StartedAt) : null
+                startedAt: finalInspectInfo.State.Running && finalInspectInfo.State.StartedAt ? new Date(finalInspectInfo.State.StartedAt) : null,
+                createdAt: new Date(finalInspectInfo.Created)
             };
-            
             dbContainerRecord = await prisma.container.create({
                 data: containerDataForDb,
                 select: { id: true, status: true, hostPort: true, internalPort: true, projectId: true, templateId: true, createdAt: true, startedAt: true, stoppedAt: true }
             });
-            console.log(`[API Containers] New Container DB record created: ${dbContainerRecord.id}`);
-
-        } else if (dbContainerRecord && dockerContainerInfo) { // Existing DB & Docker container
-            const portBindings = dockerContainerInfo.NetworkSettings.Ports;
-            const internalPortKey = template.defaultPort ? `${template.defaultPort}/tcp` : undefined;
-            const currentHostPort = internalPortKey && portBindings && portBindings[internalPortKey] && portBindings[internalPortKey]?.length > 0
-                ? parseInt(portBindings[internalPortKey]?.[0]?.HostPort || '0')
-                : null;
-            const currentStatus = (dockerContainerInfo.State.Running ? 'RUNNING' : dockerContainerInfo.State.Status) as ContainerStatus;
-
-            if (dbContainerRecord.status !== currentStatus || dbContainerRecord.hostPort !== currentHostPort) {
-                dbContainerRecord = await prisma.container.update({
-                    where: { id: dbContainerRecord.id },
-                    data: { status: currentStatus, hostPort: currentHostPort, startedAt: (currentStatus === 'RUNNING' && !dbContainerRecord.startedAt && dockerContainerInfo.State?.StartedAt) ? new Date(dockerContainerInfo.State.StartedAt) : dbContainerRecord.startedAt },
-                    select: { id: true, status: true, hostPort: true, internalPort: true, projectId: true, templateId: true, createdAt: true, startedAt: true, stoppedAt: true }
-                });
-             }
+            console.log(`[API Containers] New DB record for container ${dbContainerRecord.id} created with hostPort ${dbContainerRecord.hostPort}`);
         }
 
-
-        if (!dbContainerRecord) throw new Error("Failed to ensure container DB record readiness.");
-
-        // Update project with container ID and set status if container is running
+        if (!dbContainerRecord || !dbContainerRecord.id) {
+            throw new Error("Container DB record could not be established or found.");
+        }
+        
         if (project.containerId !== dbContainerRecord.id) {
             await prisma.project.update({
                 where: { id: projectId },
                 data: { containerId: dbContainerRecord.id },
             });
-            console.log(`[API Containers] Linked/Updated project ${projectId} with container record ${dbContainerRecord.id}.`);
+            console.log(`[API Containers] Project ${projectId} linked to container ID ${dbContainerRecord.id}.`);
         }
 
-        const responseContainerData: Container = {
+        const responseContainerData: Container = { // Use imported 'Container' type
             id: dbContainerRecord.id,
             projectId: dbContainerRecord.projectId,
             templateId: dbContainerRecord.templateId,
             status: dbContainerRecord.status,
             hostPort: dbContainerRecord.hostPort,
+            // internalPort: dbContainerRecord.internalPort, // Uncomment if in your SharedContainerType
             createdAt: dbContainerRecord.createdAt.toISOString(),
             startedAt: dbContainerRecord.startedAt ? dbContainerRecord.startedAt.toISOString() : undefined,
             stoppedAt: dbContainerRecord.stoppedAt ? dbContainerRecord.stoppedAt.toISOString() : undefined
         };
-        res.status(200).json(responseContainerData);
+        res.status(wasNewContainerActuallyCreated ? 201 : 200).json(responseContainerData);
 
     } catch (error: any) {
-        console.error(`[API Containers] Error in POST / for project ${projectId}, template ${templateId}:`, error);
-        if (createdOrFoundDockerContainerId) {
-             console.log(`[API Containers] Attempting cleanup for Docker container ${createdOrFoundDockerContainerId} due to error.`);
+        console.error(`[API Containers] General Error in POST / (Project: ${projectId}, Template: ${templateId}):`, error.message, error.stack);
+        if (wasNewContainerActuallyCreated && containerIdForCleanup) {
+             console.log(`[API Containers] Error occurred. Attempting cleanup for Docker container ${containerIdForCleanup}.`);
              try {
-                 const containerToClean = docker.getContainer(createdOrFoundDockerContainerId);
-                 await containerToClean.remove({ force: true }).catch(() => {});
-                 console.log(`[API Containers] Cleaned up Docker container ${createdOrFoundDockerContainerId}`);
+                const containerToClean = docker.getContainer(containerIdForCleanup);
+                await containerToClean.remove({ force: true }).catch(() => {});
+                console.log(`[API Containers] Cleaned up Docker container ${containerIdForCleanup}.`);
              } catch (cleanupError: any) {
-                 if (cleanupError.statusCode !== 404) {
-                     console.error(`[API Containers] Error during cleanup of Docker container ${createdOrFoundDockerContainerId}:`, cleanupError.message);
-                 }
+                if (cleanupError.statusCode !== 404) {
+                     console.error(`[API Containers] Error during cleanup of Docker container ${containerIdForCleanup}:`, cleanupError.message);
+                }
              }
-         }
+        }
         next(error);
     }
 });
+
 
 /**
  * POST /api/containers/:id/start

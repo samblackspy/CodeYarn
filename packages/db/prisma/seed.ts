@@ -47,26 +47,6 @@ await prisma.template.deleteMany({});
   });
   console.log(`Upserted template: node-basic`);
 
-  await prisma.template.upsert({
-    where: { id: 'react-vite' },
-    update: {
-        startCommand: '/bin/sh',
-        sourceHostPath: null // <--- ADD THIS LINE TO THE UPDATE BLOCK
-    },
-    create: {
-      id: 'react-vite',
-      name: 'React (Vite)',
-      description: 'Modern React application with Vite',
-      iconUrl: '/icons/react.svg',
-      dockerImage: 'codeyarn-react-vite:latest',
-      sourceHostPath: null, // <<< ADD ACTUAL PATH
-      startCommand: 'npm run dev -- --host 0.0.0.0',
-      defaultPort: 5173,
-      tags: ['react', 'javascript', 'frontend', 'vite'],
-      repositoryUrl: null,
-    },
-  });
-   console.log(`Upserted template: react-vite`);
 
 await prisma.template.upsert({
     where: { id: 'nextjs-app' }, // Or whatever ID you chose (e.g., 'nextjs')
