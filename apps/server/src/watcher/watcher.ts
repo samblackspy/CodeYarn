@@ -91,8 +91,10 @@ function sendEventToBackend(eventData: { event: string; type: string; path: stri
 function startInotifywait() {
     console.log('[Watcher] Starting inotifywait process...');
     const args = [
-        '-m', '-r', '-q',
-        '--format', '%w%f %e',
+        '-m', // Monitor indefinitely
+        '-r', // Watch directories recursively
+        '-q', // Quiet (suppress non-event messages)
+        '--format', '%w%f %e', // Output format
         '-e', 'create', '-e', 'delete', '-e', 'modify',
         '-e', 'moved_to', '-e', 'moved_from',
         WATCH_PATH

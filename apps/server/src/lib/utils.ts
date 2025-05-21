@@ -47,10 +47,10 @@ export function buildTreeFromFlatList(nodes: PrismaFileNode[], projectId: string
          };
     }
 
-    const nodeMap = new Map<string, FileStructureNode>(); // Map: Node ID -> Tree Node
+    const nodeMap = new Map<string, FileStructureNode>(); // Map Node ID to Tree Node
     const rootNodes: FileStructureNode[] = []; // Array to hold top-level nodes
 
-    // --- First Pass: Create map entries and identify root nodes ---
+    // --- First Pass: Create map entries and identify root nodes 
     nodes.forEach(dbNode => {
         // Create the tree node structure, converting dates to ISO strings
         const treeNode: FileStructureNode = {
@@ -74,7 +74,7 @@ export function buildTreeFromFlatList(nodes: PrismaFileNode[], projectId: string
         }
     });
 
-    // --- Second Pass: Link children to their parents ---
+    // Second Pass: Link children to their parents 
     nodeMap.forEach(treeNode => {
         // If the node has a parentId, find the parent in the map
         if (treeNode.parentId !== null) {
@@ -84,7 +84,8 @@ export function buildTreeFromFlatList(nodes: PrismaFileNode[], projectId: string
                 parent.children.push(treeNode); // Add the current node as a child
             } else {
                  // Log a warning for orphan nodes or nodes whose parent isn't marked as a directory
-                 console.warn(`[buildTree] Orphan node or invalid parent found: ${treeNode.path} (parentId: ${treeNode.parentId})`);
+                 console.warn(`[buildTree] Orphan node or invalid parent found: ${treeNode.path} 
+                    (parentId: ${treeNode.parentId})`);
                  // Depending on requirements, orphan nodes could be added to rootNodes or ignored
             }
         }

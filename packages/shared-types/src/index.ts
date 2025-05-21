@@ -1,3 +1,5 @@
+// @codeyarn/shared-types
+// packages/shared-types/src/index.ts
 /**
  * Represents the structure of a file or folder within a project's workspace.
  * This will be stored persistently in the database and used to represent

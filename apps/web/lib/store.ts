@@ -1,3 +1,4 @@
+// apps/web/lib/store.ts
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware'; // Optional: for Redux DevTools integration
 import {

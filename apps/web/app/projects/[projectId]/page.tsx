@@ -7,7 +7,7 @@ import { Project as SharedProjectType, Container as SharedContainerType } from '
 import { useAppStore } from '@/lib/store';
 
 // Import your main IDE layout component
-import MainIdeLayout from '@/app/components/MainIdeLayout'; // FIXME: Replace with your actual IDE layout component path
+import MainIdeLayout from '@/app/components/MainIdeLayout'; 
 import { Loader2 } from 'lucide-react'; // For loading indicator
 
 export default function ProjectIdePage() {
