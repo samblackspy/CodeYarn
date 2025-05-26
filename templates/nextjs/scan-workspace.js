@@ -1,121 +1,118 @@
-// /usr/local/bin/scan-workspace.js (inside the container)
+// (Place this in your Docker runner image, e.g., at /usr/local/bin/scan-workspace.js)
+// Make sure it's executable: chmod +x /usr/local/bin/scan-workspace.js
 
+// Import Node.js built-in modules for file system and path operations.
 const fs = require('fs');
 const path = require('path');
+
+// Define the root directory within the container to scan.
 const workspaceDir = '/workspace';
 
-// Define patterns for directories/files to exclude from being listed and stored in DB
-const EXCLUDE_PATTERNS = [
-    /^\/node_modules(\/.*)?$/,      // Matches /node_modules or /node_modules/foo/bar.js
-    /^\/\.git(\/.*)?$/,           // Matches /.git or /.git/hooks/pre-commit
-    /^\/\.next(\/.*)?$/,           // Matches /.next or /.next/static/chunks/main.js
-    /^\/\.npm(\/.*)?$/,            // Exclude .npm cache directory in workspace
-    /^\/build(\/.*)?$/,           // Example: common 'build' folder
-    /^\/dist(\/.*)?$/,            // Example: common 'dist' folder
-    // Add any other patterns for files/folders starting from the logical root of what you scan
-];
-// Common text file extensions to attempt reading content for
-const TEXT_FILE_EXTENSIONS = [
-    '.js', '.jsx', '.ts', '.tsx', '.json', '.html', '.htm', '.css', '.scss', '.less',
-    '.md', '.txt', '.xml', '.yaml', '.yml', '.svg', '.gitignore', '.npmrc', '.editorconfig',
-    '.env', '.babelrc', '.eslintrc', '.prettierrc'
-    // Add more as needed
-];
-
-function isExcluded(normalizedPath) {
-    return EXCLUDE_PATTERNS.some(pattern => pattern.test(normalizedPath));
-}
-
-function isTextFile(fileName) {
-    const ext = path.extname(fileName).toLowerCase();
-    return TEXT_FILE_EXTENSIONS.includes(ext);
-}
-
-function walk(currentDirPathRelative) {
+/**
+ * Recursively walks a directory to gather information about files and subdirectories.
+ * @param {string} currentDirPathRelative - The current directory path relative to workspaceDir.
+ * @param {string} currentPathForOutput - (Not directly used in this version's logic for path construction, but was likely intended for building output paths).
+ * @returns {Array<Object>} An array of objects, each representing a file or directory.
+ */
+function walk(currentDirPathRelative, currentPathForOutput = '') {
+    // Initialize an array to store results for the current directory level.
     let results = [];
+    // Construct the full absolute system path for the current directory being scanned.
     const fullCurrentSystemPath = path.join(workspaceDir, currentDirPathRelative);
 
     try {
-        const entries = fs.readdirSync(fullCurrentSystemPath, { withFileTypes: true });
-
-        for (const entry of entries) {
-            const entryName = entry.name;
+        // Read all entries (files and directories) in the current system path.
+        const list = fs.readdirSync(fullCurrentSystemPath);
+        // Iterate over each entry.
+        list.forEach(entryName => {
+            // Construct the path of the entry relative to workspaceDir.
             const entryPathInWorkspaceRelative = path.join(currentDirPathRelative, entryName);
-            
-            // Normalize path to always use forward slashes and start with / (relative to a conceptual workspace root)
-            // For DB consistency, paths like /index.js, /src/component.js are good.
-            const normalizedDbPath = ('/' + entryPathInWorkspaceRelative.replace(/\\/g, '/')).replace(/\/\//g, '/');
+            // Construct the full absolute system path for the current entry.
+            const fullEntrySystemPath = path.join(workspaceDir, entryPathInWorkspaceRelative);
+            let stat; // Variable to store file statistics.
 
-            if (isExcluded(normalizedDbPath)) {
-                // console.log(`[Scan WS] Excluding: ${normalizedDbPath}`);
-                continue; // Skip this entry and do not recurse if it's a directory
-            }
-
-            const fullEntrySystemPathOnHost = path.join(workspaceDir, entryPathInWorkspaceRelative);
-            let stat;
             try {
-                stat = entry.isDirectory() ? entry : fs.statSync(fullEntrySystemPathOnHost); // fs.Dirent may not have full stat
-                if (!entry.isDirectory() && !entry.isFile() && !entry.isSymbolicLink()) { // Handle other types if necessary
-                    stat = fs.statSync(fullEntrySystemPathOnHost); // Fallback to stat for other types if readdir didn't give enough
-                }
+                // Get file statistics (like type, size) for the current entry.
+                stat = fs.statSync(fullEntrySystemPath);
             } catch (e) {
-                // console.error(`[Scan WS] Error stating file ${fullEntrySystemPathOnHost}: ${e.message}`);
-                continue; // Skip if cannot stat
+                // If stating the file fails (e.g., broken symlink), log an error (commented out) and skip this entry.
+                // console.error(`Error stating file ${fullEntrySystemPath}: ${e.message}`);
+                return;
             }
 
+            // Normalize the output path to always use forward slashes, start with a leading '/', and remove duplicate slashes.
+            const normalizedOutputPath = ('/' + entryPathInWorkspaceRelative.replace(/\\/g, '/')).replace(/\/\//g, '/');
+
+            // Construct the data object for the current file/directory entry.
             const fileData = {
-                name: entryName,
-                path: normalizedDbPath,
-                isDirectory: stat.isDirectory(),
-                content: null // Default to null content
+                name: entryName, // Name of the file or directory.
+                path: normalizedOutputPath, // Normalized path relative to /workspace, starting with /.
+                isDirectory: stat.isDirectory(), // Boolean indicating if it's a directory.
             };
-            
-            if (!stat.isDirectory() && stat.size < 1 * 1024 * 1024) { // 1MB limit for content
-                if (isTextFile(entryName)) {
-                    try {
-                        fileData.content = fs.readFileSync(fullEntrySystemPathOnHost, 'utf8');
-                    } catch (contentError) {
-                        console.error(`[Scan WS] Error reading UTF-8 content of ${normalizedDbPath}: ${contentError.message}. Storing as null.`);
-                        fileData.content = null; // Ensure it's null if read fails
-                    }
-                } else if (stat.size === 0) {
-                    fileData.content = ""; // Empty files are fine
-                } else {
-                    // console.log(`[Scan WS] Skipping content for non-text/binary or large file: ${normalizedDbPath}`);
+
+            // If it's a file and not too large (under 1MB), attempt to read its content.
+            if (!stat.isDirectory() && stat.size < 1024 * 1024) { // 1MB limit
+                try {
+                    // Read file content as a UTF-8 string.
+                    fileData.content = fs.readFileSync(fullEntrySystemPath, 'utf8');
+                } catch (contentError) {
+                    // If reading content fails, log an error (actual error, not commented out) and proceed without content.
+                    console.error(`Error reading content of ${normalizedOutputPath}: ${contentError.message}`);
+                    // The file entry will still be included in results, just without the 'content' property.
                 }
             }
+            // Add the processed file/directory data to the results array.
             results.push(fileData);
 
+            // If the current entry is a directory, recursively call walk for this subdirectory.
             if (stat.isDirectory()) {
-                results = results.concat(walk(entryPathInWorkspaceRelative));
+                // Concatenate the results from the recursive call to the current results.
+                results = results.concat(walk(entryPathInWorkspaceRelative, normalizedOutputPath));
             }
-        }
+        });
     } catch (e) {
-        // console.error(`[Scan WS] Error reading directory ${fullCurrentSystemPath}: ${e.message}`);
+        // If reading the directory itself fails (e.g., doesn't exist, permissions issue), log error (commented out).
+        // console.error(`Error reading directory ${fullCurrentSystemPath}: ${e.message}`);
+        // The function will return the (likely empty) results array up to this point.
     }
+    // Return the accumulated results for this directory level and its children.
     return results;
 }
 
+// Main execution block for the script.
 try {
+    // Initialize the array for final results.
     let finalResults = [];
-    // Add the /workspace root directory itself if it's not excluded
-    if (!isExcluded('/workspace')) {
-         finalResults.push({
-            name: 'workspace', // The logical root name in the UI might just be the project name though
-            path: '/workspace', // This path will be the parent for top-level files like /index.js
-            isDirectory: true,
-            content: null
-        });
+    // Attempt to add the /workspace root directory itself to the results.
+    try {
+        const rootStat = fs.statSync(workspaceDir); // Get stats for the main workspace directory.
+        if (rootStat.isDirectory()) {
+            // If /workspace is a directory, add it as the top-level entry.
+            finalResults.push({
+                name: 'workspace', // Or derive from path.basename(workspaceDir) for flexibility.
+                path: '/workspace', // Standardized path for the root.
+                isDirectory: true,  // It is a directory.
+            });
+        }
+    } catch (e) {
+        // If /workspace itself cannot be stated (e.g., empty volume before files are copied), this block is skipped.
+        // This is expected if the volume is initially empty.
     }
 
-    // Scan contents of /workspace. currentDirPathRelative starts as ''
-    finalResults = finalResults.concat(walk('')); 
+    // Perform the recursive walk starting from the base of workspaceDir (represented by an empty relative path).
+    // Concatenate the walked results with any initial results (like the /workspace entry).
+    finalResults = finalResults.concat(walk('', '/workspace'));
 
-    // Deduplicate by path, as /workspace might be added twice if walk also returns it.
+    // Remove duplicate entries by path. This can happen if /workspace was added manually
+    // and also implicitly included or re-added by the walk function logic.
+    // It creates a Map using 'path' as the key, which naturally de-duplicates, then converts values back to an array.
     const uniqueResults = Array.from(new Map(finalResults.map(item => [item.path, item])).values());
-    
+
+    // Write the final, unique list of file/directory objects as a JSON string to standard output.
     process.stdout.write(JSON.stringify(uniqueResults));
 } catch (e) {
-    // process.stderr.write(`[Scan WS] Critical error: ${e.message}\n`);
-    process.stdout.write("[]"); // Output empty array on critical error
+    // If any critical error occurs during the main execution block, log it to stderr (commented out).
+    // process.stderr.write(`Error generating file structure: ${e.message}`);
+    // Output an empty JSON array to stdout to indicate failure but provide valid JSON.
+    process.stdout.write("[]");
 }

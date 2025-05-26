@@ -6,7 +6,7 @@ import {
     listProjectsHandler,
     getProjectDetailsHandler,
     deleteProjectHandler
-} from './projectHandlers'; // Adjust import path as needed
+} from './projectHandlers';
 
 const router: Router = express.Router();
 

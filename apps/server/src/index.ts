@@ -3,7 +3,6 @@ import { app, httpServer, setupBaseRoutes, startServer } from './core/serverSetu
 import { setupCoreMiddleware, setupErrorHandlers } from './core/middleware';
 import { initializeSocketIO } from './socket/ioServer';
 import { initializeConnectionHandlers } from './socket/connectionHandler';
-import { dockerTestRouter } from './dockerClient';
 import { internalFSRouter } from './api/internalFSRouter';
 
 // Import your existing route handlers
@@ -26,7 +25,6 @@ app.use('/api/containers', containerRoutes);
 app.use('/api/files', fileRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/templates', templateRoutes);
-app.use('/api', dockerTestRouter); // Mount the Docker test router, e.g. /api/docker/containers
 app.use('/api', internalFSRouter); // Mount internal FS router, e.g. /api/internal/filesystem-event
 
 // 5. Initialize Socket.IO Connection Handlers
